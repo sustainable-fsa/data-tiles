@@ -119,6 +119,99 @@ as_5070 <- function(x) {
   }
 }
 
+## ── The AlbersUSA inset placement ────────────────────────────────────────────
+## A frozen replication of tigris::shift_geometry(position = "below",
+## preserve_area = FALSE) — the defaults the boundary archives call it with.
+##
+## WHY FROZEN RATHER THAN CALLED. shift_geometry() derives its placement from a
+## LIVE download of cb_2020_us_state_20m every run: the CONUS bbox sets the
+## targets, and the three state centroids set the scaling origins. If that file
+## or tigris' pinned year ever changes, the composite moves — and every tileset
+## already published silently misregisters against every new one. The constants
+## below were reproduced from that file digit for digit (see
+## tools/check-constants.R) and are now ours.
+##
+## The placement, from tigris' own place_geometry_wilke():
+##   (geometry - centroid) * scale + target
+## i.e. the region's centroid lands exactly on `target`. Targets are
+## xmin + {0.08, 0.35, 0.65} * width and ymin + {0.07, 0, 0} * height of the
+## CONUS bbox, which is why they are stated as absolutes here.
+AUSA <- list(
+  conus_bbox = c(xmin = -2356113.74289801, ymin = -1338125.39538785,
+                 xmax =  2258154.44089948, ymax =  1558935.38955247),
+  ## State bboxes in ESRI:102003, for classifying features and clipping Hawaii.
+  ## Pairwise disjoint from the CONUS bbox, so once features are exploded to
+  ## POLYGON the classification cannot misfire.
+  ak_bbox = c(xmin = -5440929.96067486, ymin =  2322903.16005841,
+              xmax = -2202062.97194359, ymax =  4591568.43850457),
+  hi_bbox = c(xmin = -6293423.07766197, ymin =   -75047.09982280,
+              xmax = -5977299.56434244, ymax =   483191.00172252),
+  pr_bbox = c(xmin =  3041730.62298520, ymin = -1686301.53708693,
+              xmax =  3320182.26939249, ymax = -1567207.11273847),
+  ak = list(crs = 3338,          scale = 0.5,
+            centroid = c( 81494.8750232504, 1538488.2508510202),
+            target   = c(-1986972.28819421, -1135331.14044203)),
+  hi = list(crs = "ESRI:102007", scale = 1.5,
+            centroid = c( 68668.365457044,   803703.899762258),
+            target   = c(-741119.878568889, -1338125.395387850)),
+  pr = list(crs = 32161,         scale = 2.5,
+            centroid = c(197517.918898814,   242967.470173348),
+            target   = c(643160.576570359, -1338125.395387850))
+)
+
+## Place one inset: reproject to its own CRS, scale about the frozen centroid,
+## land that centroid on the frozen target, then RELABEL as ESRI:102003 without
+## transforming — which is what tigris does, and why the result must never be
+## st_transform()ed afterwards (see to_dummy()).
+place_inset <- function(x, spec) {
+  g <- sf::st_transform(sf::st_geometry(x), spec$crs)
+  g <- (g - spec$centroid) * spec$scale + sf::st_sfc(sf::st_point(spec$target))
+  g <- sf::st_set_crs(g, "ESRI:102003")
+  sf::st_geometry(x) <- g
+  x
+}
+
+## Lay a true-position dataset out as the AlbersUSA composite.
+##
+## @param x an sf in any CRS, EXPLODED TO POLYGON if `state_fips` is NULL.
+##   tigris classifies per FEATURE by bbox intersection, so a continental
+##   MULTIPOLYGON matches Alaska first and the whole country lands in the AK
+##   inset. Counties should pass `state_fips`; the USDM must explode first.
+## @param state_fips optional 2-character state FIPS per feature. Deterministic,
+##   and the right choice whenever the data carries it.
+## @return an sf labelled ESRI:102003, insets in place
+albers_usa_shift <- function(x, state_fips = NULL) {
+  x <- sf::st_transform(x, "ESRI:102003")
+  if (is.null(state_fips)) {
+    within <- function(bb) {
+      c <- suppressWarnings(sf::st_coordinates(sf::st_centroid(sf::st_geometry(x))))
+      c[, 1] >= bb[["xmin"]] & c[, 1] <= bb[["xmax"]] &
+        c[, 2] >= bb[["ymin"]] & c[, 2] <= bb[["ymax"]]
+    }
+    state_fips <- ifelse(within(AUSA$ak_bbox), "02",
+                  ifelse(within(AUSA$hi_bbox), "15",
+                  ifelse(within(AUSA$pr_bbox), "72", "00")))
+  }
+  state_fips <- substr(as.character(state_fips), 1, 2)
+
+  parts <- list(x[!state_fips %in% c("02", "15", "72"), ])
+  if (any(state_fips == "02")) {
+    parts <- c(parts, list(place_inset(x[state_fips == "02", ], AUSA$ak)))
+  }
+  if (any(state_fips == "15")) {
+    ## tigris clips Hawaii to its own bbox first, dropping the far
+    ## north-western islands that would otherwise stretch the inset.
+    hi <- suppressWarnings(
+      sf::st_intersection(x[state_fips == "15", ],
+                          sf::st_as_sfc(sf::st_bbox(AUSA$hi_bbox, crs = sf::st_crs("ESRI:102003")))))
+    parts <- c(parts, list(place_inset(hi, AUSA$hi)))
+  }
+  if (any(state_fips == "72")) {
+    parts <- c(parts, list(place_inset(x[state_fips == "72", ], AUSA$pr)))
+  }
+  do.call(rbind, parts)
+}
+
 ## ── The bounds gate ──────────────────────────────────────────────────────────
 ## A vertex outside the frozen box means a mis-shift, and a mis-shift silently
 ## multiplies the tileset extent. This stops the build; it must never warn.
