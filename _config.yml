@@ -1,0 +1,9 @@
+title: Sustainable FSA Data Tiles
+description: Vector tiles (PMTiles) of the FSA county composite and the US Drought Monitor, pre-projected into the sfsa-albers-usa/1 dummy-Albers space.
+author: R. Kyle Bocinsky
+url: "https://sustainable-fsa.com/data-tiles/"
+baseurl: "/data-tiles"
+
+remote_theme: jekyll/minima
+plugins:
+  - jekyll-remote-theme
