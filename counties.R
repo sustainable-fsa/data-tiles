@@ -33,8 +33,19 @@ sf::sf_use_s2(FALSE)
 options(tigris_use_cache = TRUE)
 
 ## ── Configuration ────────────────────────────────────────────────────────────
-MAXZOOM <- 15L      # 0.72 m at extra-detail 13; pixel-exact to display zoom 19
-DETAIL  <- 13L      # MapLibre's internal EXTENT is 8192; above this is rounded away
+MAXZOOM <- 15L      # where full source detail lands
+DETAIL  <- 13L      # tile extent 2^13 = 8192, MapLibre's own internal EXTENT
+SIMPLIFY <- 0.5     # half tippecanoe's default tolerance at the low zooms
+
+## DETAIL APPLIES AT EVERY ZOOM, via --full-detail. An earlier version used
+## --extra-detail, which lifts the extent to 8192 at MAXZOOM ONLY and leaves
+## every lower zoom at the 4096 default. Tippecanoe then simplifies each of
+## those to about one tile unit — which is ~0.125 CSS px, but ~0.25 px on a 2x
+## display, and every modern screen is 2x. The result was visible faceting from
+## z6 to z14 while maxzoom was perfect, which reads exactly like "the tiles are
+## low resolution". Measured on the densest county (Somerset, ME; 28,381 source
+## vertices), --full-detail=13 with SIMPLIFY 0.5 carries 1.4-1.5x more vertices
+## at every intermediate zoom for ~7% more bytes.
 
 ## Territories the archives drop: AS, VI, and the four Pacific FIPS.
 DROP_STATES <- c("60", "78", "14", "52", "69", "66")
@@ -61,7 +72,7 @@ dir.create("tiles", showWarnings = FALSE)
 message("clip mask: cb 5m counties, year ", MASK_YEAR)
 ## tigris returns NAD83 (EPSG:4269); the boundary parquet is WGS84. Align them
 ## explicitly rather than relying on either default.
-mask <- tigris::counties(cb = TRUE, resolution = "5m", year = MASK_YEAR,
+mask <- tigris::counties(cb = TRUE, resolution = "500k", year = MASK_YEAR,
                          progress_bar = FALSE) |>
   sf::st_transform(4326) |>
   sf::st_union() |>
@@ -190,7 +201,8 @@ build_vintage <- function(v) {
 
   ## ── Tiles ─────────────────────────────────────────────────────────────────
   ## Flag rationale, in one place:
-  ##   --extra-detail=13            extent 8192 at maxzoom; MapLibre rounds above
+  ##   --full-detail=13             extent 8192 at EVERY zoom, not just maxzoom
+  ##   --simplification=0.5         half the default tolerance below maxzoom
   ##   --simplify-only-low-zooms    THE lossless flag: no simplification at maxzoom
   ##   --no-simplification-of-shared-nodes  or adjacent counties crack apart at low zoom
   ##   --no-tiny-polygon-reduction  or sub-pixel islands become area-equivalent squares
@@ -208,7 +220,8 @@ build_vintage <- function(v) {
     sprintf("--named-layer=counties:%s", f_counties),
     sprintf("--named-layer=states:%s", f_states),
     "--minimum-zoom=0", sprintf("--maximum-zoom=%d", MAXZOOM),
-    sprintf("--extra-detail=%d", DETAIL),
+    sprintf("--full-detail=%d", DETAIL),
+    sprintf("--simplification=%s", format(SIMPLIFY)),
     "--simplify-only-low-zooms", "--no-simplification-of-shared-nodes",
     "--no-tiny-polygon-reduction", "--no-tile-size-limit", "--no-feature-limit",
     "--include=id", "--include=state", "--include=county",
