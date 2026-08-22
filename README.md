@@ -11,12 +11,19 @@ authoritative data of its own:
 
 | input | from |
 |---|---|
-| county boundaries, full resolution, true-position WGS84 | [`fsa-counties-dd17`](https://github.com/sustainable-fsa/fsa-counties-dd17), [`fsa-counties-dd22`](https://github.com/sustainable-fsa/fsa-counties-dd22) |
+| FSA county boundaries, full resolution, true-position WGS84 | [`fsa-counties-dd17`](https://github.com/sustainable-fsa/fsa-counties-dd17), [`fsa-counties-dd22`](https://github.com/sustainable-fsa/fsa-counties-dd22) |
+| vintage-matched Census counties, clipped to each year's own waterline | [`census-counties`](https://github.com/sustainable-fsa/census-counties) |
+| the boundaries FSA's LFP determinations are computed against | [`fsa-lfp-counties`](https://github.com/sustainable-fsa/fsa-lfp-counties) |
 | weekly USDM polygons, GeoParquet, WGS84 | [`usdm`](https://github.com/sustainable-fsa/usdm) |
 
 Those repositories stay projection-neutral and publish real coordinates in a
 real CRS. Everything app-specific — the territory filter, the coastline clip,
 the AlbersUSA inset shift, the dummy rescale, the tiling — happens here.
+
+The three county sets disagree with one another, and the disagreement is
+load-bearing: each archive's statistics were computed against its own polygons,
+so a choropleth has to be drawn on the polygons its numbers came from. They stay
+three separate tilesets, and one is never substituted for another.
 
 ## The coordinate space
 
@@ -47,9 +54,16 @@ Two consequences worth knowing before consuming these tiles:
 ## Layout
 
 ```
+counties.R                   FSA county tiles (dd17/dd22)
+census.R                     vintage-matched Census county tiles, 18 vintages
+fsa-lfp-counties.R           the NDMC/FSA LFP determination boundaries
 R/dummy-space.R              the ONLY copy of the transform
 tools/check-registration.R   gate G4 — proves it matches the JavaScript
+tools/check-coverage.R       proves no county was silently dropped
 ```
+
+Each build script takes `PUBLISH=0` to build locally without uploading;
+`census.R` also takes `VINTAGES=` to narrow a run.
 
 `R/dummy-space.R` is deliberately **not** vendored into the archive repos, the
 way `R/s3-archive.R` is. Two implementations of a projection that disagree
@@ -62,10 +76,17 @@ exactly how it happens.
 
 ```sh
 Rscript tools/check-registration.R
+TILESET=fsa-lfp-counties Rscript tools/check-coverage.R
 ```
 
-Runs the twelve reference points from the specification — the header of
-`js/projection.js` in
+`check-coverage.R` decodes the built tiles and asserts that every county in the
+source is present at every zoom the app can display — the one pipeline failure
+that does not look like a failure, because a choropleth with holes still renders
+as a map. It takes `TILESET` (the PMTiles basename) and defaults to
+`fsa-counties-dd22`.
+
+`check-registration.R` runs the twelve reference points from the specification
+— the header of `js/projection.js` in
 [`lfp-explorer`](https://github.com/sustainable-fsa/lfp-explorer) — through the
 R implementation and asserts agreement to **1e-9 dummy degrees** (about half a
 millimetre). Three of the twelve sit at high |y|, which is deliberate: the shear
