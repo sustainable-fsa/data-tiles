@@ -12,6 +12,7 @@ census.R              vintage-matched Census county tiles, 18 vintages
 fsa-lfp-counties.R    the NDMC/FSA LFP determination boundaries
 R/dummy-space.R       the AlbersUSA shift and dummy-space transform
 R/outline.R           the dissolved national outline and its pinhole guard
+R/publish.R           the artifact classes and the ONLY copy of the cache policy
 R/s3-archive.R        vendored shared S3 helpers
 tools/                the four gates
 build/  tiles/        intermediates and PMTiles output
@@ -185,10 +186,7 @@ it wrote".
 
    The bytes uploaded were the audited ones, not a re-derivation. A rebuild
    reproduces them — census 2009 and 2020 were checked byte for byte — but
-   nothing had gated a fresh build, and publishing is effectively one-way:
-   `s3_put` writes the PMTiles `immutable` with a one-year max-age, so a
-   correction under the same filename is invisible to anyone holding a copy.
-   **A real correction needs a new filename, not an invalidation.**
+   nothing had gated a fresh build.
 
    The three scripts now end the way every sibling archive does, with
    `s3_write_manifest()` + `cf_invalidate()`. None of them did, so the first
@@ -198,12 +196,18 @@ it wrote".
    `census.R` and `fsa-lfp-counties.R` now call `dissolve_outline()`. dd17/dd22
    happen to carry no pinholes, so the two agree by luck rather than by
    construction — adopt the helper the next time those are rebuilt.
-3. **`immutable` is the wrong cache policy for a filename that gets revised.**
-   Twice now the census PMTiles have been republished under the same names, and
-   only because nothing consumes them yet. `max-age=31536000, immutable` means
-   an edge invalidation does not reach a browser that already holds the file. If
-   these tilesets are still in flux, either shorten the max-age or put a content
-   hash in the filename before anyone starts consuming them.
+3. **The cache policy is `public, max-age=3600`, and it used to be
+   `immutable`.** Fixed 2026-08-22; the reasoning lives in `R/publish.R`'s
+   header. Short version: `immutable` under a filename that is stable across
+   rebuilds is a contradiction, those exact keys were republished twice in one
+   session, and an edge invalidation does not reach a browser that already holds
+   a file it was told would never change. If real immutability is ever wanted,
+   it has to be a content hash in the filename — that is the only version of the
+   promise that is true.
+
+   All 63 published objects were re-stamped in place with a server-side copy
+   (`--metadata-directive REPLACE`, which drops anything not restated, so both
+   headers go every time). No re-upload, sizes unchanged, Range still 206.
 
 ## Related
 

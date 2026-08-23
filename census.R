@@ -37,6 +37,7 @@ suppressPackageStartupMessages({
 source("R/dummy-space.R")
 source("R/outline.R")
 source("R/s3-archive.R")
+source("R/publish.R")
 sf::sf_use_s2(FALSE)
 options(tigris_use_cache = TRUE)
 
@@ -275,21 +276,9 @@ for (o in out) message(sprintf("  %d  counties %5d  vertices %10s  %6.1f MB  (ma
 
 if (publish) {
   for (o in out) {
-    s3_put(bucket = s3_bucket,
-           key = paste0(s3_prefix, "/tiles/", basename(o$pmtiles)),
-           file = o$pmtiles,
-           content_type = "application/octet-stream",
-           cache_control = "public, max-age=31536000, immutable")
-    s3_put(bucket = s3_bucket,
-           key = paste0(s3_prefix, "/tiles/", basename(o$index)),
-           file = o$index,
-           content_type = "application/json",
-           cache_control = "max-age=3600")
-    s3_put(bucket = s3_bucket,
-           key = paste0(s3_prefix, "/tiles/", basename(o$outline)),
-           file = o$outline,
-           content_type = "application/geo+json",
-           cache_control = "max-age=3600")
+    put_artifact(s3_bucket, s3_prefix, o$pmtiles)
+    put_artifact(s3_bucket, s3_prefix, o$index)
+    put_artifact(s3_bucket, s3_prefix, o$outline)
   }
 
   ## Every sibling archive ends here, and none of this repo's scripts did.
@@ -297,10 +286,9 @@ if (publish) {
   ## tiles are published but undiscoverable. It lists the whole prefix, so
   ## whichever script runs last leaves a complete one.
   s3_write_manifest(bucket = s3_bucket, prefix = s3_prefix)
-  ## The PMTiles go up immutable with a one-year max-age, so a REPUBLISH under
-  ## the same filename would sit behind the edge cache until 2027. The wildcard
-  ## counts as one invalidation path. It does NOT reach a browser that already
-  ## holds the file — for that the filename has to change.
+  ## Filenames are stable across rebuilds, so an invalidation is what makes a
+  ## republish visible now rather than after R/publish.R's max-age. The wildcard
+  ## counts as one invalidation path, against 54 for a per-file list.
   cf_invalidate(c(paste0("/", s3_prefix, "/tiles/*"),
                   paste0("/", s3_prefix, "/_manifest.txt")))
   message("\npublished ", length(out), " vintage(s)")

@@ -40,6 +40,7 @@ suppressPackageStartupMessages({
 source("R/dummy-space.R")
 source("R/outline.R")
 source("R/s3-archive.R")
+source("R/publish.R")
 sf::sf_use_s2(FALSE)
 options(tigris_use_cache = TRUE)
 
@@ -221,31 +222,18 @@ message(sprintf("  %s: %.1f MB", basename(f_pmtiles), file.size(f_pmtiles) / 104
 
 ## ── Publish ──────────────────────────────────────────────────────────────────
 if (publish) {
-  s3_put(bucket = s3_bucket,
-         key = paste0(s3_prefix, "/tiles/", basename(f_pmtiles)),
-         file = f_pmtiles,
-         content_type = "application/octet-stream",
-         cache_control = "public, max-age=31536000, immutable")
-  s3_put(bucket = s3_bucket,
-         key = paste0(s3_prefix, "/tiles/", basename(f_index)),
-         file = f_index,
-         content_type = "application/json",
-         cache_control = "max-age=3600")
-  s3_put(bucket = s3_bucket,
-         key = paste0(s3_prefix, "/tiles/", basename(f_outline)),
-         file = f_outline,
-         content_type = "application/geo+json",
-         cache_control = "max-age=3600")
+  put_artifact(s3_bucket, s3_prefix, f_pmtiles)
+  put_artifact(s3_bucket, s3_prefix, f_index)
+  put_artifact(s3_bucket, s3_prefix, f_outline)
 
   ## Every sibling archive ends here, and none of this repo's scripts did.
   ## _manifest.txt is what puts a prefix in the CDN listing: without it these
   ## tiles are published but undiscoverable. It lists the whole prefix, so
   ## whichever script runs last leaves a complete one.
   s3_write_manifest(bucket = s3_bucket, prefix = s3_prefix)
-  ## The PMTiles go up immutable with a one-year max-age, so a REPUBLISH under
-  ## the same filename would sit behind the edge cache until 2027. The wildcard
-  ## counts as one invalidation path. It does NOT reach a browser that already
-  ## holds the file — for that the filename has to change.
+  ## Filenames are stable across rebuilds, so an invalidation is what makes a
+  ## republish visible now rather than after R/publish.R's max-age. The wildcard
+  ## counts as one invalidation path, against 54 for a per-file list.
   cf_invalidate(c(paste0("/", s3_prefix, "/tiles/*"),
                   paste0("/", s3_prefix, "/_manifest.txt")))
   message("\npublished to s3://", s3_bucket, "/", s3_prefix)

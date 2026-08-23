@@ -115,9 +115,11 @@ a county index, county names or a centroid.
 
 PMTiles are served `application/octet-stream` with **no `Content-Encoding`**:
 the header records `tile_compression = gzip` and the client shim decompresses,
-while a `Content-Encoding` would break Range semantics. They are `immutable`
-with a one-year max-age, so a correction needs a new filename — invalidating the
-edge does not reach a browser that already holds the file.
+while a `Content-Encoding` would break Range semantics.
+
+Everything under this prefix is `public, max-age=3600`. Filenames are stable
+across rebuilds, so nothing here is `immutable` — a publish invalidates the
+edge, and an hour is the longest a client can hold a superseded copy.
 
 ## Citation
 
