@@ -178,9 +178,23 @@ it wrote".
 
 ## Open threads
 
-1. **Nothing is published.** Everything in `tiles/` was built with `PUBLISH=0`.
-   The census vintages alone are ~1.1 GB, and `s3_put` writes them
-   `immutable` with a one-year max-age, so publishing is one-way in practice.
+1. **Published 2026-08-22** to `s3://sustainable-fsa/data-tiles/tiles/`, 45
+   objects / 1.29 GB, verified over the CDN: correct content types, HTTP 206 on
+   a range request, and no `Content-Encoding` on the PMTiles (which would break
+   Range semantics — the header records `tile_compression = gzip` and the client
+   shim decompresses).
+
+   The bytes uploaded were the audited ones, not a re-derivation. A rebuild
+   reproduces them — census 2009 and 2020 were checked byte for byte — but
+   nothing had gated a fresh build, and publishing is effectively one-way:
+   `s3_put` writes the PMTiles `immutable` with a one-year max-age, so a
+   correction under the same filename is invisible to anyone holding a copy.
+   **A real correction needs a new filename, not an invalidation.**
+
+   The three scripts now end the way every sibling archive does, with
+   `s3_write_manifest()` + `cf_invalidate()`. None of them did, so the first
+   publish went up unlisted and `_manifest.txt` had to be written by hand. The
+   invalidation uses `/<prefix>/tiles/*`, which counts as a single path.
 2. **The census vintages have no `states` mesh layer and no outline.** The
    sidecars landed 2026-08-22; these two did not. `counties.R` precomputes the
    mesh with `ms_innerlines()` because MVT has no mesh operation, and publishes

@@ -94,6 +94,25 @@ millimetre). Three of the twelve sit at high |y|, which is deliberate: the shear
 correction vanishes at the equator, so a producer that skipped it would pass a
 centre-only test and be 765 m out at the edges.
 
+## Published artifacts
+
+<https://data.sustainable-fsa.com/data-tiles/tiles/>, listed in
+[`_manifest.txt`](https://data.sustainable-fsa.com/data-tiles/_manifest.txt):
+
+```
+census-counties-<year>.pmtiles        2000, 2009, 2010, 2011-2025
+census-counties-<year>-index.json
+fsa-lfp-counties.pmtiles              + -index.json, -outline-dummy.geojson
+fsa-counties-dd17.pmtiles             + -index.json, -outline-dummy.geojson
+fsa-counties-dd22.pmtiles             + -index.json, -outline-dummy.geojson
+```
+
+PMTiles are served `application/octet-stream` with **no `Content-Encoding`**:
+the header records `tile_compression = gzip` and the client shim decompresses,
+while a `Content-Encoding` would break Range semantics. They are `immutable`
+with a one-year max-age, so a correction needs a new filename — invalidating the
+edge does not reach a browser that already holds the file.
+
 ## Citation
 
 Bocinsky, R. Kyle. *Sustainable FSA Data Tiles*. Montana Climate Office,

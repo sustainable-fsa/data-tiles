@@ -274,6 +274,18 @@ if (publish) {
          file = f_outline,
          content_type = "application/geo+json",
          cache_control = "max-age=3600")
+
+  ## Every sibling archive ends here, and none of this repo's scripts did.
+  ## _manifest.txt is what puts a prefix in the CDN listing: without it these
+  ## tiles are published but undiscoverable. It lists the whole prefix, so
+  ## whichever script runs last leaves a complete one.
+  s3_write_manifest(bucket = s3_bucket, prefix = s3_prefix)
+  ## The PMTiles go up immutable with a one-year max-age, so a REPUBLISH under
+  ## the same filename would sit behind the edge cache until 2027. The wildcard
+  ## counts as one invalidation path. It does NOT reach a browser that already
+  ## holds the file — for that the filename has to change.
+  cf_invalidate(c(paste0("/", s3_prefix, "/tiles/*"),
+                  paste0("/", s3_prefix, "/_manifest.txt")))
   message("\npublished to s3://", s3_bucket, "/", s3_prefix)
 } else {
   message("\nPUBLISH=0 — built locally, nothing uploaded")
