@@ -45,11 +45,19 @@ MAXZOOM  <- 15L
 DETAIL   <- 13L
 SIMPLIFY <- 0.5
 
-## The vintages usdm-counties archives, and therefore the vintages a week of
-## USDM data can be matched to. census-counties discovers these rather than
-## hardcoding them; here they are the list to build, and a vintage that has not
-## been published yet fails loudly on the fetch.
-ALL_VINTAGES <- c(2000, 2009, 2010, 2011:2025)
+## DISCOVERED, NOT HARDCODED, for the same reason census-counties discovers
+## them: a hardcoded list cannot notice the year Census publishes a new vintage,
+## and this script would have gone on building eighteen for as long as nobody
+## edited it. One request to the upstream manifest, which is authoritative about
+## what the clipped form actually contains.
+archive_vintages <- function() {
+  m <- readLines(file.path(CENSUS_COUNTIES, "_manifest.txt"), warn = FALSE)
+  m <- grep("/data/clipped/[0-9]{4}-counties\\.parquet$", m, value = TRUE)
+  v <- sort(unique(as.integer(sub("^.*/([0-9]{4})-counties\\.parquet$", "\\1", m))))
+  if (!length(v))
+    stop("no clipped vintages in ", CENSUS_COUNTIES, "/_manifest.txt", call. = FALSE)
+  v
+}
 
 ## Territories the composite cannot place: dummy-Albers lays out CONUS, AK, HI
 ## and PR only. The archive carries these counties, so the filter is ours.
@@ -71,8 +79,7 @@ CLIPPED <- function(y) Sys.getenv(
 s3_bucket <- Sys.getenv("S3_BUCKET", unset = "sustainable-fsa")
 s3_prefix <- Sys.getenv("S3_PREFIX", unset = "data-tiles")
 publish   <- Sys.getenv("PUBLISH", unset = "1") == "1"
-vintages  <- as.integer(strsplit(Sys.getenv("VINTAGES",
-                paste(ALL_VINTAGES, collapse = ",")), "[, ]+")[[1]])
+force     <- Sys.getenv("FORCE", unset = "0") == "1"
 
 dir.create("build", showWarnings = FALSE)
 dir.create(file.path("build", "census"), showWarnings = FALSE, recursive = TRUE)
@@ -98,16 +105,59 @@ source_for <- function(y) {
   f
 }
 
+vintages <- Sys.getenv("VINTAGES", unset = "")
+vintages <- if (nzchar(vintages)) {
+  as.integer(strsplit(vintages, "[, ]+")[[1]])
+} else {
+  archive_vintages()
+}
+message(length(vintages), " vintage(s) in scope")
+
+## ── What to build, and separately what to publish ────────────────────────────
+## A vintage is three artifacts and is only done when all three are present. The
+## rule is usdm.R's, and both halves are load-bearing: keying the BUILD off the
+## S3 listing alone makes a machine that already holds everything rebuild it to
+## upload, and keying it off local files alone makes a CI runner — which clones
+## a repo where tiles/ is gitignored — rebuild all eighteen to add one.
+##
+## Without this the script rebuilt every vintage every run: half an hour and
+## 1.2 GB republished to produce byte-identical output, which is why the weekly
+## workflow could not afford to call it.
+artifacts_for <- function(y) file.path("tiles", c(
+  sprintf("census-counties-%d.pmtiles", y),
+  sprintf("census-counties-%d-index.json", y),
+  sprintf("census-counties-%d-outline-dummy.geojson", y)))
+
+published <- if (publish) {
+  basename(s3_list_keys(s3_bucket, paste0(s3_prefix, "/tiles"))$Key)
+} else character(0)
+
+archived <- function(y) all(basename(artifacts_for(y)) %in% published)
+on_disk  <- function(y) all(file.exists(artifacts_for(y)))
+
+wanted <- if (force || !publish) {
+  vintages
+} else {
+  vintages[!vapply(vintages, archived, logical(1))]
+}
+to_build <- if (force) vintages else wanted[!vapply(wanted, on_disk, logical(1))]
+if (length(to_build) < length(vintages))
+  message("  ", length(vintages) - length(to_build),
+          " vintage(s) already archived or built, skipping (FORCE=1 to rebuild)")
+
 ## ── State names ──────────────────────────────────────────────────────────────
 ## census-counties publishes the Census schema — STATEFP, COUNTYFP, County,
 ## CountyLSAD, year, mask_year, Area — and no state name. The old source carried
 ## one only because usdm-counties joined it before republishing. Join it the
 ## same way usdm-counties.R and usdm-counties-census-2020.R do.
-states <- tigris::states(cb = TRUE, year = STATE_NAME_YEAR,
-                         progress_bar = FALSE) |>
-  sf::st_drop_geometry() |>
-  dplyr::select(stfips = STATEFP, state = NAME) |>
-  dplyr::arrange(stfips)
+## Fetched only when there is something to build — a no-op run should not pull
+## a Census shapefile it will not look at.
+states <- if (length(to_build)) {
+  tigris::states(cb = TRUE, year = STATE_NAME_YEAR, progress_bar = FALSE) |>
+    sf::st_drop_geometry() |>
+    dplyr::select(stfips = STATEFP, state = NAME) |>
+    dplyr::arrange(stfips)
+} else NULL
 
 build_vintage <- function(y) {
   message("\n=== census ", y, " ===")
@@ -268,18 +318,25 @@ build_vintage <- function(y) {
        bytes = file.size(f_pm))
 }
 
-out <- lapply(vintages, build_vintage)
+out <- lapply(to_build, build_vintage)
 
-message("\n", strrep("-", 64))
-for (o in out) message(sprintf("  %d  counties %5d  vertices %10s  %6.1f MB  (mask cb %d)",
-  o$year, o$n, format(o$vertices, big.mark = ","), o$bytes / 1048576, o$mask_year))
+if (length(out)) {
+  message("\n", strrep("-", 64))
+  for (o in out) message(sprintf("  %d  counties %5d  vertices %10s  %6.1f MB  (mask cb %d)",
+    o$year, o$n, format(o$vertices, big.mark = ","), o$bytes / 1048576, o$mask_year))
+}
 
 if (publish) {
-  for (o in out) {
-    put_artifact(s3_bucket, s3_prefix, o$pmtiles)
-    put_artifact(s3_bucket, s3_prefix, o$index)
-    put_artifact(s3_bucket, s3_prefix, o$outline)
-  }
+  ## Publish what the bucket lacks, not what this run happened to build: a
+  ## vintage can be complete on disk from an earlier local run and still be
+  ## missing upstream.
+  to_pub <- if (force) vintages else vintages[!vapply(vintages, archived, logical(1))]
+  message("publishing ", length(to_pub), " of ", length(vintages), " vintage(s)")
+  files <- unlist(lapply(to_pub, artifacts_for))
+  ## to_build covered exactly the not-archived-and-not-local vintages, so every
+  ## file here exists by now. Assert it rather than discovering a gap mid-upload.
+  stopifnot(all(file.exists(files)))
+  for (f in files) put_artifact(s3_bucket, s3_prefix, f)
 
   ## Every sibling archive ends here, and none of this repo's scripts did.
   ## _manifest.txt is what puts a prefix in the CDN listing: without it these
@@ -291,7 +348,7 @@ if (publish) {
   ## counts as one invalidation path, against 54 for a per-file list.
   cf_invalidate(c(paste0("/", s3_prefix, "/tiles/*"),
                   paste0("/", s3_prefix, "/_manifest.txt")))
-  message("\npublished ", length(out), " vintage(s)")
+  message("\npublished ", length(to_pub), " vintage(s)")
 } else {
   message("\nPUBLISH=0 — built locally, nothing uploaded")
 }

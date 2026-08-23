@@ -137,13 +137,13 @@ edge, and an hour is the longest a client can hold a superseded copy.
 
 `.github/workflows/data-tiles.yaml` runs **Thursdays at 21:00 UTC**, behind the
 whole USDM cascade (`usdm` publishes at 13:00, `usdm-counties` at 20:20). It
-runs `usdm.R` only: the county tilesets are built from frozen vintages, and
-rebuilding all eighteen Census years weekly would republish 1.4 GB of identical
-output. Use the workflow's `scripts` input when a new boundary vintage lands.
+runs `usdm.R` and `census.R`. Both discover what exists upstream and skip
+whatever the bucket already holds, so a quiet Thursday costs two list calls and
+publishes nothing. `counties.R` and `fsa-lfp-counties.R` build frozen archives
+and are reachable through the workflow's `scripts` input.
 
-A freshness precheck skips the run when the week is already archived, and
-`usdm.R` skips it again from the S3 listing, so a quiet Thursday costs one list
-call.
+A freshness precheck skips scheduled runs when the current USDM week is already
+archived; pushes and manual dispatches always proceed.
 
 ## Citation
 

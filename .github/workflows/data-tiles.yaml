@@ -6,11 +6,15 @@
 # data-tiles/usdm/ went stale seven days after every manual run with nothing to
 # say so.
 #
-# The scheduled path therefore runs usdm.R ONLY. The county scripts rebuild all
-# eighteen Census vintages from scratch — they have no per-vintage skip — so
-# running them weekly would burn half an hour and republish 1.4 GB to produce
-# byte-identical output. They are available through the `scripts` input when a
-# new boundary vintage actually lands.
+# The scheduled path runs usdm.R and census.R. Both discover their inputs from
+# the upstream manifest and skip anything the bucket already holds, so a quiet
+# week costs two list calls and publishes nothing — census.R only does work in
+# the year Census posts a new vintage, and it now notices that on its own.
+#
+# counties.R and fsa-lfp-counties.R are NOT scheduled. They still rebuild
+# unconditionally, and their sources are frozen archives that change only when
+# someone re-runs a FOIA or a boundary release; reach them with the `scripts`
+# input.
 name: update
 run-name: Update the data-tiles archive → S3
 
@@ -24,10 +28,10 @@ on:
         default: false
       scripts:
         description: >-
-          Space-separated build scripts to run. Default is the weekly USDM only;
-          use e.g. "census.R" when a new Census vintage lands.
+          Space-separated build scripts. Defaults to the weekly pair; use
+          "counties.R" or "fsa-lfp-counties.R" to rebuild a frozen tileset.
         type: string
-        default: usdm.R
+        default: usdm.R census.R
   schedule:
     # Thursdays, 21:00 UTC — behind the whole USDM cascade. usdm publishes at
     # 13:00 (14:45 in winter) and usdm-counties at 20:20, so by 21:00 the week
@@ -67,14 +71,17 @@ jobs:
           MINE: https://data.sustainable-fsa.com/data-tiles/usdm
           EVENT: ${{ github.event_name }}
           FORCE: ${{ inputs.force }}
-          SCRIPTS: ${{ inputs.scripts }}
         run: |
           set -uo pipefail
 
-          # Code changes, an explicit force, and any run that is not the plain
-          # weekly USDM all go straight through.
-          if [ "$EVENT" = push ] || [ "${FORCE:-false}" = true ] \
-             || { [ -n "${SCRIPTS:-}" ] && [ "${SCRIPTS:-}" != usdm.R ]; }; then
+          # ONLY THE CRON IS GATED. A push changed the code and a dispatch is
+          # somebody asking, so both go straight through; the gate exists to
+          # save runner minutes on a Thursday when the USDM has not moved.
+          # Earlier this also inspected the script list, to avoid skipping a
+          # census-only run on a quiet USDM week — unnecessary now that both
+          # scripts skip on their own, and one less string to keep in step with
+          # the input default.
+          if [ "$EVENT" != schedule ] || [ "${FORCE:-false}" = true ]; then
             echo "proceed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -120,7 +127,7 @@ jobs:
       AWS_REGION: us-west-2
       CLOUDFRONT_DISTRIBUTION_ID: E1BNL6ONVN84RI
       CLOUDFRONT_BASE: https://data.sustainable-fsa.com
-      SCRIPTS: ${{ inputs.scripts || 'usdm.R' }}
+      SCRIPTS: ${{ inputs.scripts || 'usdm.R census.R' }}
     steps:
       - uses: mt-climate-office/actions/setup-geospatial@v1
 

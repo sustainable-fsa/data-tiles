@@ -276,13 +276,17 @@ it wrote".
    is what makes a CI build byte-identical to a local one — verified end to end
    by deleting a published week and letting the workflow rebuild it: same
    sha256, `4a4b96c7`.
-4. **The weekly cron runs `usdm.R` only.** The county scripts rebuild all
-   eighteen Census vintages from scratch — no per-vintage skip — so running them
-   weekly would burn half an hour and republish 1.4 GB of byte-identical output.
-   They are reachable through the workflow's `scripts` input when a new boundary
-   vintage actually lands. A push that edits `R/dummy-space.R` therefore does
-   NOT rebuild the county tilesets; the transform gates run, but re-tiling is
-   still a manual call.
+4. **The weekly cron runs `usdm.R` and `census.R`.** Both discover their inputs
+   from the upstream manifest and skip whatever the bucket already holds, so a
+   quiet week costs two list calls. `census.R` only does work in the year Census
+   posts a new vintage, and now notices that on its own rather than waiting for
+   someone to edit a hardcoded list.
+
+   `counties.R` and `fsa-lfp-counties.R` are **not** scheduled and still rebuild
+   unconditionally; their sources are frozen archives. A push that edits
+   `R/dummy-space.R` therefore does NOT re-tile them — the transform gates run,
+   but re-tiling stays a manual call, which is deliberate: a 1.4 GB republish
+   should not be a side effect of a commit.
 5. **Nothing masks the USDM overspill yet.** It is published unclipped by
    design, so until `lfp-explorer` draws the inverse of the active outline above
    it, the overlay shows the USDM's own ~1:2M coastline running past the
