@@ -83,7 +83,8 @@ TILESET=fsa-lfp-counties Rscript tools/check-coverage.R
 source is present at every zoom the app can display — the one pipeline failure
 that does not look like a failure, because a choropleth with holes still renders
 as a map. It takes `TILESET` (the PMTiles basename) and defaults to
-`fsa-counties-dd22`.
+`fsa-counties-dd22`. Where a tileset has both an archive to check against and a
+published index sidecar, the archive is the authority and the two are compared.
 
 `check-registration.R` runs the twelve reference points from the specification
 — the header of `js/projection.js` in

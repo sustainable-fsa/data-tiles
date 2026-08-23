@@ -31,10 +31,16 @@ choropleth has to be drawn on the polygons its numbers came from.
 | `fsa-lfp-counties.R` | `fsa-lfp-counties` | `fsa-lfp-counties` (FOIA) | **not at all** — see below |
 
 Every one of them lands in `sfsa-albers-usa/1`, drops the same six territory
-FIPS, and carries `id` / `state` / `county` string properties. `counties.R` and
-`fsa-lfp-counties.R` also publish a `states` innerlines layer, an
-`-outline-dummy.geojson` and an `-index.json` sidecar; the census vintages
-publish the PMTiles alone.
+FIPS, carries `id` / `state` / `county` string properties, and publishes an
+`-index.json` sidecar. `counties.R` and `fsa-lfp-counties.R` additionally
+publish a `states` innerlines layer inside the PMTiles and an
+`-outline-dummy.geojson`; the census vintages have neither, so their sidecar's
+`tiles.layers` lists `counties` alone.
+
+The census sidecars carry two fields the others do not: `vintage`, the boundary
+year as a string, and **`mask_year`, the coastline the geometry was actually cut
+at** — not always the vintage, and the app has no other way to know it. Both are
+additive to `sfsa-county-index/1`.
 
 ## census.R: repointed 2026-08-22, builds all 18 vintages
 
@@ -157,24 +163,29 @@ Rscript tools/check-coverage.R                                    # dd22, defaul
 ```
 
 `check-coverage.R` takes `TILESET` (the PMTiles basename) as well as the
-original `VINTAGE`. Expected ids come from `tiles/<TILESET>-index.json` where
-there is one; for `census-counties-<year>` there is not, so it re-derives them
-from the cached clipped parquet and re-applies the territory filter itself.
-**Deriving them from the source rather than from anything `census.R` wrote is
-the point** — a gate that trusts the build's own bookkeeping cannot catch the
-build losing a county before tippecanoe ever saw it.
+original `VINTAGE`. The **source wins wherever there is a rule for it**: for
+`census-counties-<year>` the gate re-derives the ids from the cached clipped
+parquet and re-applies the territory filter itself, rather than reading them out
+of the sidecar. A gate that trusts the build's own bookkeeping cannot catch the
+build losing a county before tippecanoe ever saw it. Everything else falls back
+to `tiles/<TILESET>-index.json`.
+
+**Where both exist they are compared, and a disagreement is a failure.** That
+check is the only thing standing behind the sidecars — without it, publishing an
+index for a tileset that already had a source rule would silently demote this
+gate from "the tiles match the archive" to "the tiles match what the build said
+it wrote".
 
 ## Open threads
 
 1. **Nothing is published.** Everything in `tiles/` was built with `PUBLISH=0`.
    The census vintages alone are ~1.1 GB, and `s3_put` writes them
    `immutable` with a one-year max-age, so publishing is one-way in practice.
-2. **The census vintages have no `-index.json`.** dd17/dd22 and
-   `fsa-lfp-counties` publish one, and the app cannot do county lookup,
-   `counties.names` or `countyCentroid()` from tiles alone —
-   `queryRenderedFeatures` returns only what is rendered. Eighteen sidecars at
-   ~230 KB is cheap; it just was not in the repoint plan.
-3. `census.R` and `fsa-lfp-counties.R` were untracked. Commit them.
+2. **The census vintages have no `states` mesh layer and no outline.** The
+   sidecars landed 2026-08-22; these two did not. `counties.R` precomputes the
+   mesh with `ms_innerlines()` because MVT has no mesh operation, and publishes
+   the outline because the USDM pipeline clips against it. Adding both to
+   `census.R` means re-tiling all eighteen, ~30 minutes.
 
 ## Related
 

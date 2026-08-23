@@ -31,7 +31,7 @@
 ## =============================================================================
 
 suppressPackageStartupMessages({
-  library(sf); library(arrow); library(dplyr); library(tigris)
+  library(sf); library(arrow); library(dplyr); library(tigris); library(jsonlite)
 })
 source("R/dummy-space.R")
 source("R/s3-archive.R")
@@ -171,6 +171,47 @@ build_vintage <- function(y) {
   message(sprintf("  vertices: %s   geojsonl %.0f MB", format(nv, big.mark = ","),
                   file.size(f_geo) / 1048576))
 
+  ## ── The index sidecar ─────────────────────────────────────────────────────
+  ## Same schema as the dd17/dd22 and fsa-lfp-counties sidecars, and a hard
+  ## requirement for the same reason: queryRenderedFeatures() returns only what
+  ## is rendered, clipped and simplified for the zoom, so tiles alone cannot
+  ## supply counties.index, counties.names or countyCentroid().
+  ##
+  ## Two fields the other sidecars do not carry. `vintage` is the boundary year
+  ## as a string, where dd17/dd22 use their archive's name. `mask_year` is the
+  ## coastline the geometry was cut at, which is NOT always the vintage — 2000,
+  ## 2009 and 2011 are cut at cb 2010 and 2012 at cb 2013 — and the app has no
+  ## other way to know it. Additive: a reader of sfsa-county-index/1 that does
+  ## not know either key is unaffected.
+  bxs <- do.call(rbind, lapply(sf::st_geometry(x), function(gi) as.numeric(sf::st_bbox(gi))))
+  idx <- list(
+    schema    = jsonlite::unbox("sfsa-county-index/1"),
+    space     = jsonlite::unbox(SFSA_SPACE),
+    vintage   = jsonlite::unbox(as.character(y)),
+    mask_year = jsonlite::unbox(mask_year),
+    n         = jsonlite::unbox(nrow(x)),
+    bounds    = as.numeric(DUMMY$bounds[c("xmin", "ymin", "xmax", "ymax")]),
+    tiles     = list(
+      url      = jsonlite::unbox(sprintf("census-counties-%d.pmtiles", y)),
+      minzoom  = jsonlite::unbox(0L),
+      maxzoom  = jsonlite::unbox(MAXZOOM),
+      extent   = jsonlite::unbox(8192L),
+      ## One layer, unlike dd17/dd22 and fsa-lfp-counties: these vintages carry
+      ## no precomputed state mesh.
+      layers   = list(counties = jsonlite::unbox("counties"))
+    ),
+    counties     = x$id,
+    county_names = x$county,
+    state_names  = x$state,
+    ## Index-aligned bbox columns, 6 dp (0.54 m). Parallel arrays rather than
+    ## objects, matching the house payload convention.
+    x0 = round(bxs[, 1], 6), y0 = round(bxs[, 2], 6),
+    x1 = round(bxs[, 3], 6), y1 = round(bxs[, 4], 6)
+  )
+  f_index <- file.path("tiles", sprintf("census-counties-%d-index.json", y))
+  jsonlite::write_json(idx, f_index, auto_unbox = FALSE, digits = NA)
+  message("  index: ", nrow(x), " counties, ", round(file.size(f_index) / 1024), " KB")
+
   f_pm <- file.path("tiles", sprintf("census-counties-%d.pmtiles", y))
   args <- c(
     sprintf("--output=%s", f_pm), "--force",
@@ -194,7 +235,7 @@ build_vintage <- function(y) {
   message(sprintf("  %s: %.1f MB", basename(f_pm), file.size(f_pm) / 1048576))
 
   list(year = y, mask_year = mask_year, n = nrow(x), vertices = nv,
-       pmtiles = f_pm, bytes = file.size(f_pm))
+       pmtiles = f_pm, index = f_index, bytes = file.size(f_pm))
 }
 
 out <- lapply(vintages, build_vintage)
@@ -210,6 +251,11 @@ if (publish) {
            file = o$pmtiles,
            content_type = "application/octet-stream",
            cache_control = "public, max-age=31536000, immutable")
+    s3_put(bucket = s3_bucket,
+           key = paste0(s3_prefix, "/tiles/", basename(o$index)),
+           file = o$index,
+           content_type = "application/json",
+           cache_control = "max-age=3600")
   }
   message("\npublished ", length(out), " vintage(s)")
 } else {

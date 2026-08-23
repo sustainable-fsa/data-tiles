@@ -17,14 +17,18 @@
 ## 3,045 of 3,106 at z0, complete from z4 up. The app's zoom floor sits near
 ## display zoom 6.5, so it never requests a zoom that is short.
 ##
-## WHERE THE EXPECTED IDS COME FROM, in order:
-##   1. tiles/<TILESET>-index.json, for the tilesets that publish a sidecar
-##      (fsa-counties-dd17/dd22, fsa-lfp-counties).
-##   2. for census-counties-<year>, the cached clipped parquet the build read,
-##      re-filtered here. Deriving them again from the source rather than from
-##      anything census.R wrote is the point: a gate that trusts the build's own
-##      bookkeeping cannot catch the build losing a county before tippecanoe
-##      ever saw it.
+## WHERE THE EXPECTED IDS COME FROM. The source wins wherever there is a rule
+## for it — for census-counties-<year>, the cached clipped parquet the build
+## read, re-filtered here. Deriving them again from the source rather than from
+## anything census.R wrote is the point: a gate that trusts the build's own
+## bookkeeping cannot catch the build losing a county before tippecanoe ever
+## saw it. Otherwise they come from tiles/<TILESET>-index.json.
+##
+## WHERE BOTH EXIST, THEY ARE COMPARED, and a disagreement is a failure. That
+## check is the only thing standing behind the sidecars: without it, publishing
+## an index for a tileset that already had a source rule would silently demote
+## this gate from "the tiles match the archive" to "the tiles match what the
+## build said it wrote".
 ##
 ##   Rscript tools/check-coverage.R                                  # dd22
 ##   TILESET=fsa-lfp-counties Rscript tools/check-coverage.R
@@ -70,16 +74,32 @@ expected_from_census <- function(year) {
                   as.character(p$County))
 }
 
-expected <-
-  if (file.exists(INDEX)) {
-    expected_from_index()
-  } else if (grepl("^census-counties-[0-9]{4}$", TILESET)) {
-    suppressPackageStartupMessages(library(arrow))
-    expected_from_census(sub("^census-counties-", "", TILESET))
-  } else {
-    stop("check-coverage: no index sidecar at ", INDEX,
-         " and no source rule for tileset '", TILESET, "'.", call. = FALSE)
-  }
+from_index <- if (file.exists(INDEX)) expected_from_index() else NULL
+
+from_source <- if (grepl("^census-counties-[0-9]{4}$", TILESET)) {
+  suppressPackageStartupMessages(library(arrow))
+  expected_from_census(sub("^census-counties-", "", TILESET))
+} else NULL
+
+if (is.null(from_index) && is.null(from_source))
+  stop("check-coverage: no index sidecar at ", INDEX,
+       " and no source rule for tileset '", TILESET, "'.", call. = FALSE)
+
+if (!is.null(from_index) && !is.null(from_source)) {
+  only_idx <- setdiff(unname(from_index), unname(from_source))
+  only_src <- setdiff(unname(from_source), unname(from_index))
+  if (length(only_idx) || length(only_src))
+    stop("check-coverage: the index sidecar and the source disagree.\n",
+         "  in the index but not the archive: ",
+         if (length(only_idx)) paste(head(sort(only_idx), 8), collapse = ", ") else "none", "\n",
+         "  in the archive but not the index: ",
+         if (length(only_src)) paste(head(sort(only_src), 8), collapse = ", ") else "none",
+         call. = FALSE)
+  cat("  sidecar agrees with the archive\n")
+}
+
+## The source is the authority wherever there is a rule for it.
+expected <- if (!is.null(from_source)) from_source else from_index
 
 total <- unique(unname(expected))
 cat(sprintf("%s: %d counties expected\n", TILESET, length(total)))
