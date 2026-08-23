@@ -44,6 +44,13 @@ ARTIFACTS <- list(
        cache_control = CACHE_TILES),
   list(pattern = "-outline-dummy\\.geojson$",
        content_type = "application/geo+json",
+       cache_control = CACHE_TILES),
+  ## application/json, not application/topojson or application/geo+json: it is
+  ## what the boundary archives settled on, and it is what CloudFront will
+  ## compress — worth 3x over the wire on exactly the payload the app scrubs
+  ## through fastest.
+  list(pattern = "\\.topojson$",
+       content_type = "application/json",
        cache_control = CACHE_TILES)
 )
 
@@ -54,13 +61,17 @@ artifact_spec <- function(file) {
        call. = FALSE)
 }
 
-## Publish one artifact under <prefix>/tiles/. PMTiles carry NO Content-Encoding
-## by design: the header records tile_compression = gzip and the client shim
-## decompresses, while a Content-Encoding would break Range semantics.
-put_artifact <- function(bucket, prefix, file) {
+## Publish one artifact under <prefix>/<subdir>/. PMTiles carry NO
+## Content-Encoding by design: the header records tile_compression = gzip and the
+## client shim decompresses, while a Content-Encoding would break Range
+## semantics.
+##
+## subdir is "tiles" for everything tiled and "usdm" for the weekly TopoJSON,
+## which is 1,390 files and would otherwise swamp the tiles/ listing.
+put_artifact <- function(bucket, prefix, file, subdir = "tiles") {
   sp <- artifact_spec(file)
   s3_put(bucket = bucket,
-         key = paste0(prefix, "/tiles/", basename(file)),
+         key = paste0(prefix, "/", subdir, "/", basename(file)),
          file = file,
          content_type = sp$content_type,
          cache_control = sp$cache_control)

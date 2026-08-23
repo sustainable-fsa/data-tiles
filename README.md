@@ -57,10 +57,13 @@ Two consequences worth knowing before consuming these tiles:
 counties.R                   FSA county tiles (dd17/dd22)
 census.R                     vintage-matched Census county tiles, 18 vintages
 fsa-lfp-counties.R           the NDMC/FSA LFP determination boundaries
+usdm.R                       the weekly USDM, 1,390 weeks of TopoJSON
 R/dummy-space.R              the ONLY copy of the transform
 R/outline.R                  the dissolved outline and its pinhole guard
+R/publish.R                  artifact classes and the cache policy
 tools/check-registration.R   gate G4 — proves it matches the JavaScript
 tools/check-coverage.R       proves no county was silently dropped
+tools/check-usdm.R           proves the weekly USDM decodes and registers
 ```
 
 Each build script takes `PUBLISH=0` to build locally without uploading;
@@ -101,11 +104,20 @@ centre-only test and be 765 m out at the edges.
 [`_manifest.txt`](https://data.sustainable-fsa.com/data-tiles/_manifest.txt):
 
 ```
-census-counties-<year>.pmtiles   2000, 2009, 2010, 2011-2025
-fsa-lfp-counties.pmtiles
-fsa-counties-dd17.pmtiles
-fsa-counties-dd22.pmtiles
+tiles/census-counties-<year>.pmtiles   2000, 2009, 2010, 2011-2025
+tiles/fsa-lfp-counties.pmtiles
+tiles/fsa-counties-dd17.pmtiles
+tiles/fsa-counties-dd22.pmtiles
+usdm/USDM_<date>.topojson              1,390 weeks, 2000-01-04 onward
+usdm/usdm-index.json
 ```
+
+The USDM is **TopoJSON, not tiles**, and that is a measured choice: a week is
+five features and 100-266 K vertices of ~1:2,000,000 data, so there is nothing
+for a tile pyramid to simplify and it would cost 16x the bytes. Quantized to
+1e6 — a 4.6 m grid, 99.75% of vertices — each week is 0.1-0.6 MB over the wire.
+It is published **unclipped**; mask the overspill client-side with the inverse
+of whichever `-outline-dummy.geojson` you are drawing.
 
 Each `.pmtiles` carries a `counties` layer and a `states` innerlines layer, and
 ships with a `-index.json` sidecar and a `-outline-dummy.geojson` beside it. The

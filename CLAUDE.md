@@ -10,6 +10,7 @@ screen to show it.
 counties.R            FSA county tiles (dd17/dd22) + composite
 census.R              vintage-matched Census county tiles, 18 vintages
 fsa-lfp-counties.R    the NDMC/FSA LFP determination boundaries
+usdm.R                the weekly USDM, 1,390 weeks of TopoJSON
 R/dummy-space.R       the AlbersUSA shift and dummy-space transform
 R/outline.R           the dissolved national outline and its pinhole guard
 R/publish.R           the artifact classes and the ONLY copy of the cache policy
@@ -136,6 +137,79 @@ Two more things worth not rediscovering:
   against dd17's 1,351, because dd17's coast is `cb` 500k and this one is the
   NDMC's own. 37.2 MB of PMTiles.
 
+## usdm.R: TopoJSON, not PMTiles, and the measurement that decided it
+
+Tiling won for the counties because the source is ~7.6 M vertices — no single
+file could be both full resolution and fetchable. A USDM week is **five features
+and 100–266 K vertices** of ~1:2,000,000 data, so there is nothing to simplify
+and tiling only pays the overhead of replicating boundary geometry into every
+tile it crosses at every zoom. Measured on the worst week (2025-09-16), all
+through this same transform:
+
+| format | gzipped |
+|---|---|
+| PMTiles z0–15 | 10.02 MB |
+| FlatGeobuf | 3.39 MB |
+| GeoJSON 9 dp | 2.43 MB |
+| GeoJSON 6 dp | 1.59 MB |
+| **TopoJSON q=1e6** | **0.61 MB** |
+
+FlatGeobuf loses on its own terms: float64 coordinates are high-entropy so gzip
+takes 17% off it against 68% off text, and its spatial index is dead weight when
+every request wants the whole national extent. Decode cost — the thing that
+decides whether scrubbing janks — is a wash: `JSON.parse` 30.5 ms for GeoJSON
+against `JSON.parse` + `topojson.feature()` 31.1 ms, the ~1.4 ms of arc
+stitching offset by parsing less text. **q=1e6** is a 4.6 × 3.1 m grid retaining
+99.75% of vertices; 1e5 (46 m, 92.1%) and 1e4 (461 m, 50.1%) are simplification
+wearing an encoding's clothes.
+
+Published **unclipped**: the app switches between four county authorities and a
+baked-in coastline would mismatch three of them. The overspill is masked
+client-side with the inverse of whichever `-outline-dummy.geojson` is active —
+**which is app work that does not exist yet.**
+
+### The classifier bug it had to fix first
+
+`albers_usa_shift(state_fips = NULL)` classified by strict bbox containment and
+fell through to `"00"` — CONUS, unshifted. The frozen bboxes are the extent of
+the **counties**, and the USDM does not stop where counties do:
+
+- **0.85 km² north-west of Kauai, 226 m outside `hi_bbox`** (2005, 2010, 2013).
+  Left at true position `x = -6.27e6`, which is dummy x ≈ −10.9.
+- 13.13 km² near Point Roberts, 4,831 m above `conus_bbox` — genuinely CONUS, so
+  the fall-through was right there by luck.
+
+`classify_regions()` now pads by 25 km (the regions are 536–783 km apart, so
+they stay disjoint) and **hard-errors on anything unplaceable**. The Hawaii clip
+inside the shift is deliberately *not* padded — it would change four published
+county tilesets — so that Kauai polygon is classified HI and then clipped away,
+which is right (it is over open ocean) and is caught by the per-region area gate
+rather than being silent.
+
+### Three things that cost a cycle each
+
+- **`parallel::mclapply` cannot be used here.** It forks, and a forked child
+  that touches Objective-C runtime initialisation aborts on macOS — `sf` pulls
+  in GDAL which pulls in the system frameworks. Every worker died before doing
+  any work. `mirai` daemons are separate processes; they also match the rest of
+  the project, and `everywhere()` has to push the libraries, the working
+  directory and the config across because daemons start empty.
+- **The vertex-retention gate cannot read the arcs.** Gating on the arcs' own
+  point count needs no decode, but the deficit scales with RING COUNT — TopoJSON
+  drops each ring's closing point and dedups shared endpoints — so across seven
+  weeks the ratio swings 0.938–0.976 and a 0.95 floor rejected a perfect week.
+  Round-tripping back through mapshaper is the only honest measure: 0.995–1.000.
+- **`sub("^USDM_|\\.topojson$", "", x)` is an alternation and replaces only the
+  FIRST match**, so it stripped the prefix and left the extension. It was in the
+  incremental-skip path, where it would have corrupted every date on a
+  publishing run. `date_of()` does it in two subs.
+
+Topology building is left ON, measured rather than assumed: round-tripped
+vertices are identical with and without it (the loss is quantisation either way)
+and it is 5% smaller. Flags otherwise match `fsa-counties-dd22.R:156-166`,
+including `fix-geometry` — quantisation is a snap, and a snap can push a ring
+into itself.
+
 ## Do not build a clip mask with ms_explode + ms_dissolve
 
 `counties.R:75` builds its `cb` 5m mask with `st_union() |> st_make_valid()`,
@@ -196,7 +270,11 @@ it wrote".
    `census.R` and `fsa-lfp-counties.R` now call `dissolve_outline()`. dd17/dd22
    happen to carry no pinholes, so the two agree by luck rather than by
    construction — adopt the helper the next time those are rebuilt.
-3. **The cache policy is `public, max-age=3600`, and it used to be
+3. **Nothing masks the USDM overspill yet.** It is published unclipped by
+   design, so until `lfp-explorer` draws the inverse of the active outline above
+   it, the overlay shows the USDM's own ~1:2M coastline running past the
+   counties.
+4. **The cache policy is `public, max-age=3600`, and it used to be
    `immutable`.** Fixed 2026-08-22; the reasoning lives in `R/publish.R`'s
    header. Short version: `immutable` under a filename that is stable across
    rebuilds is a contradiction, those exact keys were republished twice in one

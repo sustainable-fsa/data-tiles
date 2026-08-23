@@ -9,3 +9,4 @@
 # Build intermediates and tiles: derived, large, and republished from source.
 build/
 tiles/
+usdm/
