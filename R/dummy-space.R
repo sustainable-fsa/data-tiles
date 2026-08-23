@@ -171,27 +171,67 @@ place_inset <- function(x, spec) {
   x
 }
 
+## ── Region classification, for data with no state FIPS ───────────────────────
+## THE FROZEN BBOXES ARE THE EXTENT OF THE COUNTIES, and nothing says another
+## dataset stops where counties do. The USDM is drawn at ~1:2,000,000 and drapes
+## over water, so its polygons sit slightly outside the region they plainly
+## belong to. Measured across the archive: an 0.85 km2 D0 polygon north-west of
+## Kauai lands 226 m outside hi_bbox — in 2005, 2010 and 2013 — and 13.13 km2
+## near Point Roberts lands 4,831 m above conus_bbox.
+##
+## This used to fall through to "00", CONUS, which is unshifted. Correct by luck
+## for Point Roberts. Silently wrong for Kauai, which stays at x = -6.27e6 and
+## lands at dummy x = -10.9 — caught by assert_dummy_bounds, but only as a build
+## that dies partway through 1,390 weeks with nothing saying why.
+##
+## So pad for CLASSIFICATION ONLY, and make an unplaceable feature a hard error
+## rather than a fall-through. The regions are 536-783 km apart at their closest
+## (AK/HI 536, AK/CONUS 764, PR/CONUS 783), so 25 km keeps them pairwise
+## disjoint by a factor of twenty.
+##
+## THE HAWAII CLIP IN albers_usa_shift() IS DELIBERATELY NOT PADDED. It exists to
+## drop the far north-western Hawaiian islands the way tigris does, and widening
+## it would change four already-published county tilesets. The Kauai polygon is
+## therefore classified as Hawaii and then clipped away — right, because it is
+## over open ocean, but callers should MEASURE that loss rather than assume it.
+CLASSIFY_PAD_M <- 25000
+
+classify_regions <- function(x) {
+  cc <- suppressWarnings(sf::st_coordinates(sf::st_centroid(sf::st_geometry(x))))
+  inside <- function(bb) {
+    cc[, 1] >= bb[["xmin"]] - CLASSIFY_PAD_M & cc[, 1] <= bb[["xmax"]] + CLASSIFY_PAD_M &
+      cc[, 2] >= bb[["ymin"]] - CLASSIFY_PAD_M & cc[, 2] <= bb[["ymax"]] + CLASSIFY_PAD_M
+  }
+  ak <- inside(AUSA$ak_bbox); hi <- inside(AUSA$hi_bbox)
+  pr <- inside(AUSA$pr_bbox); us <- inside(AUSA$conus_bbox)
+
+  orphan <- !(ak | hi | pr | us)
+  if (any(orphan)) {
+    i <- which(orphan)[1]
+    stop(sprintf(paste0(
+      "albers_usa_shift: %d feature(s) fall outside every AlbersUSA region, ",
+      "even padded by %g km.\n  first at ESRI:102003 (%.0f, %.0f)\n",
+      "  dummy-Albers places CONUS, AK, HI and PR only. An unplaced feature ",
+      "would be left at true position and misregister silently."),
+      sum(orphan), CLASSIFY_PAD_M / 1000, cc[i, 1], cc[i, 2]), call. = FALSE)
+  }
+  ## Same precedence as before: AK, then HI, then PR, then CONUS.
+  ifelse(ak, "02", ifelse(hi, "15", ifelse(pr, "72", "00")))
+}
+
 ## Lay a true-position dataset out as the AlbersUSA composite.
 ##
 ## @param x an sf in any CRS, EXPLODED TO POLYGON if `state_fips` is NULL.
-##   tigris classifies per FEATURE by bbox intersection, so a continental
-##   MULTIPOLYGON matches Alaska first and the whole country lands in the AK
-##   inset. Counties should pass `state_fips`; the USDM must explode first.
+##   Classification is per FEATURE by bbox, so a continental MULTIPOLYGON
+##   matches Alaska first and the whole country lands in the AK inset. Counties
+##   should pass `state_fips`; the USDM must explode first and is then placed by
+##   classify_regions() above.
 ## @param state_fips optional 2-character state FIPS per feature. Deterministic,
 ##   and the right choice whenever the data carries it.
 ## @return an sf labelled ESRI:102003, insets in place
 albers_usa_shift <- function(x, state_fips = NULL) {
   x <- sf::st_transform(x, "ESRI:102003")
-  if (is.null(state_fips)) {
-    within <- function(bb) {
-      c <- suppressWarnings(sf::st_coordinates(sf::st_centroid(sf::st_geometry(x))))
-      c[, 1] >= bb[["xmin"]] & c[, 1] <= bb[["xmax"]] &
-        c[, 2] >= bb[["ymin"]] & c[, 2] <= bb[["ymax"]]
-    }
-    state_fips <- ifelse(within(AUSA$ak_bbox), "02",
-                  ifelse(within(AUSA$hi_bbox), "15",
-                  ifelse(within(AUSA$pr_bbox), "72", "00")))
-  }
+  if (is.null(state_fips)) state_fips <- classify_regions(x)
   state_fips <- substr(as.character(state_fips), 1, 2)
 
   parts <- list(x[!state_fips %in% c("02", "15", "72"), ])
