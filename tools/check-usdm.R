@@ -27,14 +27,39 @@ source("R/dummy-space.R")
 sf::sf_use_s2(FALSE)
 
 DIR          <- Sys.getenv("USDM_DIR", "usdm")
+## Where to look when there is no local mirror. A CI run that publishes nothing
+## — the common case, a quiet Thursday — holds no files at all, and a gate that
+## can only read a local directory would either fail or have to be skipped. Read
+## the PUBLISHED artifacts instead: on that path this checks the thing users
+## actually fetch, which is the better test anyway.
+REMOTE       <- Sys.getenv("USDM_BASE",
+                  "https://data.sustainable-fsa.com/data-tiles/usdm")
 SAMPLE       <- as.integer(Sys.getenv("SAMPLE", "12"))
 MIN_RETAIN   <- 0.99
 CLASSES      <- paste0("D", 0:4)
 USDM_ARCHIVE <- Sys.getenv("USDM_ARCHIVE",
                            unset = "https://data.sustainable-fsa.com/usdm")
 
-f_index <- file.path(DIR, "usdm-index.json")
-stopifnot(dir.exists(DIR), file.exists(f_index))
+local_weeks <- if (dir.exists(DIR))
+  list.files(DIR, pattern = "^USDM_.*\\.topojson$") else character(0)
+remote <- !length(local_weeks)
+src_of <- if (remote) {
+  function(d) sprintf("/vsicurl/%s/USDM_%s.topojson", REMOTE, d)
+} else {
+  function(d) file.path(DIR, sprintf("USDM_%s.topojson", d))
+}
+raw_of <- if (remote) {
+  function(d) sprintf("%s/USDM_%s.topojson", REMOTE, d)
+} else {
+  function(d) file.path(DIR, sprintf("USDM_%s.topojson", d))
+}
+
+f_index <- if (remote) {
+  paste0(REMOTE, "/usdm-index.json")
+} else {
+  file.path(DIR, "usdm-index.json")
+}
+cat("checking ", if (remote) "the published archive" else DIR, "\n", sep = "")
 idx <- jsonlite::fromJSON(f_index)
 
 ## ── The index describes what is actually there ───────────────────────────────
@@ -43,15 +68,14 @@ idx <- jsonlite::fromJSON(f_index)
 ## The reverse is normal and not an error — a CI runner builds one week and
 ## mirrors nothing else, so the index legitimately names 1,389 weeks it has no
 ## file for. Only a full local mirror can assert equality, and it is told so.
-on_disk <- sort(sub("\\.topojson$", "", sub("^USDM_", "",
-             list.files(DIR, pattern = "^USDM_.*\\.topojson$"))))
+on_disk <- sort(sub("\\.topojson$", "", sub("^USDM_", "", local_weeks)))
 missing <- setdiff(on_disk, idx$dates)
 if (length(missing))
   stop("check-usdm: ", length(missing), " week(s) on disk are absent from the index",
        " — e.g. ", paste(head(missing, 5), collapse = ", "),
        "\n  an index that forgets a published week is the failure this catches.",
        call. = FALSE)
-unmirrored <- setdiff(idx$dates, on_disk)
+unmirrored <- if (remote) character(0) else setdiff(idx$dates, on_disk)
 if (length(unmirrored))
   cat(sprintf("  (%d indexed week(s) not mirrored locally — sampling the %d that are)\n",
               length(unmirrored), length(on_disk)))
@@ -62,17 +86,20 @@ cat(sprintf("index: %d weeks, %s .. %s, quantization %g\n",
 
 ## Spread the sample across the archive rather than taking the first N — a fault
 ## that only touches the sparse early years would hide behind a head().
-if (!length(on_disk))
-  stop("check-usdm: no USDM_*.topojson in ", DIR, call. = FALSE)
-pick <- on_disk[unique(round(seq(1, length(on_disk), length.out = min(SAMPLE, length(on_disk)))))]
+## Sample what is actually reachable: the local mirror if there is one, the
+## index's own date list if the archive is only remote.
+avail <- if (remote) idx$dates else on_disk
+if (!length(avail))
+  stop("check-usdm: nothing to check — no local weeks and an empty index",
+       call. = FALSE)
+pick <- avail[unique(round(seq(1, length(avail), length.out = min(SAMPLE, length(avail)))))]
 
 b <- DUMMY$bounds
 TOL <- 0.02
 bad <- character(0)
 
 for (d in pick) {
-  f <- file.path(DIR, sprintf("USDM_%s.topojson", d))
-  topo <- jsonlite::fromJSON(f, simplifyVector = FALSE)
+  topo <- jsonlite::fromJSON(raw_of(d), simplifyVector = FALSE)
 
   if (!identical(names(topo$objects), "usdm"))
     bad <- c(bad, sprintf("%s: object is '%s', expected 'usdm'", d,
@@ -88,7 +115,7 @@ for (d in pick) {
     bad <- c(bad, sprintf("%s: carries date(s) %s", d, paste(dts, collapse = ",")))
 
   ## Decoded, so this is the geometry a client would actually get.
-  g  <- sf::read_sf(f)
+  g  <- sf::read_sf(src_of(d))
   bb <- sf::st_bbox(g)
   if (bb[["xmin"]] < b[["xmin"]] - TOL || bb[["ymin"]] < b[["ymin"]] - TOL ||
       bb[["xmax"]] > b[["xmax"]] + TOL || bb[["ymax"]] > b[["ymax"]] + TOL)
@@ -111,9 +138,8 @@ for (d in pick) {
     bad <- c(bad, sprintf("%s: classes %s, source has %s", d,
                           paste(cls, collapse = ","), paste(cls_src, collapse = ",")))
 
-  cat(sprintf("  %s  %d classes  %8s verts  retained %.4f  %5.2f MB\n",
-              d, length(cls), format(nv_out, big.mark = ","), keep,
-              file.size(f) / 1048576))
+  cat(sprintf("  %s  %d classes  %8s verts  retained %.4f\n",
+              d, length(cls), format(nv_out, big.mark = ","), keep))
 }
 
 if (length(bad)) {
