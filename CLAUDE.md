@@ -270,18 +270,24 @@ it wrote".
    `census.R` and `fsa-lfp-counties.R` now call `dissolve_outline()`. dd17/dd22
    happen to carry no pinholes, so the two agree by luck rather than by
    construction — adopt the helper the next time those are rebuilt.
-3. **The weekly cron runs `usdm.R` only.** The county scripts rebuild all
+3. **`setup-geospatial` already provides mapshaper and tippecanoe.** The
+   workflow only re-pins mapshaper to 0.6.113, the version usdm.R's retention
+   gate was calibrated against; the shared action installs it unpinned. That pin
+   is what makes a CI build byte-identical to a local one — verified end to end
+   by deleting a published week and letting the workflow rebuild it: same
+   sha256, `4a4b96c7`.
+4. **The weekly cron runs `usdm.R` only.** The county scripts rebuild all
    eighteen Census vintages from scratch — no per-vintage skip — so running them
    weekly would burn half an hour and republish 1.4 GB of byte-identical output.
    They are reachable through the workflow's `scripts` input when a new boundary
    vintage actually lands. A push that edits `R/dummy-space.R` therefore does
    NOT rebuild the county tilesets; the transform gates run, but re-tiling is
    still a manual call.
-4. **Nothing masks the USDM overspill yet.** It is published unclipped by
+5. **Nothing masks the USDM overspill yet.** It is published unclipped by
    design, so until `lfp-explorer` draws the inverse of the active outline above
    it, the overlay shows the USDM's own ~1:2M coastline running past the
    counties.
-5. **The cache policy is `public, max-age=3600`, and it used to be
+6. **The cache policy is `public, max-age=3600`, and it used to be
    `immutable`.** Fixed 2026-08-22; the reasoning lives in `R/publish.R`'s
    header. Short version: `immutable` under a filename that is stable across
    rebuilds is a contradiction, those exact keys were republished twice in one

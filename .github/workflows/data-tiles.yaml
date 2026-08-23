@@ -124,27 +124,21 @@ jobs:
     steps:
       - uses: mt-climate-office/actions/setup-geospatial@v1
 
-      # NEW RUNNER DEPENDENCY, and the reason this workflow is not just a copy
-      # of census-counties'. usdm.R shells out to the mapshaper CLI for the
-      # TopoJSON encode; no other archive in the project does — dd17/dd22 run
-      # mapshaper only on a developer's machine. rmapshaper's R functions do not
-      # cover it: they run the bundled V8 build, and `-o format=topojson
-      # quantization=...` is a CLI invocation.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Install mapshaper
+      # setup-geospatial ALREADY provides node, tippecanoe (2.79.0, conda-forge)
+      # and mapshaper, so nothing else has to be installed — an earlier version
+      # of this workflow added setup-node, an npm install and a brew install of
+      # tippecanoe, all three redundant.
+      #
+      # The one thing worth overriding is the mapshaper VERSION. The shared
+      # action installs it unpinned, and usdm.R's retention gate is calibrated
+      # against a specific one: quantisation behaviour is exactly the kind of
+      # thing that can shift under a minor release. Re-pinning costs ~5 seconds
+      # and is what makes a CI build byte-identical to a local one — verified,
+      # sha256 4a4b96c7 for 2026-08-18 built both ways.
+      - name: Pin mapshaper to the calibrated version
         run: |
-          npm install -g mapshaper@0.6.113   # the version the gates were calibrated against
+          npm install -g mapshaper@0.6.113
           mapshaper -v
-
-      # Only the tiling scripts need it, and brew-installing it on every weekly
-      # USDM run would be minutes of nothing.
-      - name: Install tippecanoe
-        if: env.SCRIPTS != 'usdm.R'
-        run: |
-          brew install tippecanoe
-          tippecanoe --version
 
       - name: Configure AWS credentials (GitHub OIDC)
         uses: aws-actions/configure-aws-credentials@v6
