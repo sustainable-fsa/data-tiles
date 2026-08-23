@@ -133,6 +133,18 @@ Everything under this prefix is `public, max-age=3600`. Filenames are stable
 across rebuilds, so nothing here is `immutable` — a publish invalidates the
 edge, and an hour is the longest a client can hold a superseded copy.
 
+## Updating
+
+`.github/workflows/data-tiles.yaml` runs **Thursdays at 21:00 UTC**, behind the
+whole USDM cascade (`usdm` publishes at 13:00, `usdm-counties` at 20:20). It
+runs `usdm.R` only: the county tilesets are built from frozen vintages, and
+rebuilding all eighteen Census years weekly would republish 1.4 GB of identical
+output. Use the workflow's `scripts` input when a new boundary vintage lands.
+
+A freshness precheck skips the run when the week is already archived, and
+`usdm.R` skips it again from the S3 listing, so a quiet Thursday costs one list
+call.
+
 ## Citation
 
 Bocinsky, R. Kyle. *Sustainable FSA Data Tiles*. Montana Climate Office,

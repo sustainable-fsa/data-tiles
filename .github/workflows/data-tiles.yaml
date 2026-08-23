@@ -1,0 +1,193 @@
+# Archive-update workflow for the presentation tiles.
+#
+# THIS REPO HAD NO WORKFLOW AT ALL until now, which mattered in exactly one
+# place: usdm.R. The county tilesets are built from frozen vintages that change
+# at most once a year, but the USDM gains a week every Thursday, so
+# data-tiles/usdm/ went stale seven days after every manual run with nothing to
+# say so.
+#
+# The scheduled path therefore runs usdm.R ONLY. The county scripts rebuild all
+# eighteen Census vintages from scratch — they have no per-vintage skip — so
+# running them weekly would burn half an hour and republish 1.4 GB to produce
+# byte-identical output. They are available through the `scripts` input when a
+# new boundary vintage actually lands.
+name: update
+run-name: Update the data-tiles archive → S3
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: >-
+          Run even when the freshness precheck sees nothing new upstream.
+        type: boolean
+        default: false
+      scripts:
+        description: >-
+          Space-separated build scripts to run. Default is the weekly USDM only;
+          use e.g. "census.R" when a new Census vintage lands.
+        type: string
+        default: usdm.R
+  schedule:
+    # Thursdays, 21:00 UTC — behind the whole USDM cascade. usdm publishes at
+    # 13:00 (14:45 in winter) and usdm-counties at 20:20, so by 21:00 the week
+    # this repo needs is on the CDN. usdm dispatches its first tier directly;
+    # this is a cron because data-tiles is not in that fan-out.
+    - cron: '0 21 * * 4'
+  push:
+    branches: [main]
+    paths: ['**.R', '.github/workflows/**']
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: s3-archive-${{ github.repository }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash -l {0}
+
+jobs:
+  # Cheap gate, mirroring usdm-counties'. Anything ambiguous resolves to
+  # proceed=true, so a network blip costs a redundant run — which usdm.R's own
+  # incremental skip turns into one S3 list call — rather than silently stalling
+  # the archive. Ubuntu, not macOS: this needs GNU `date -d`.
+  precheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      proceed: ${{ steps.gate.outputs.proceed }}
+    steps:
+      - id: gate
+        env:
+          UPSTREAM: https://data.sustainable-fsa.com/usdm/data/parquet
+          MINE: https://data.sustainable-fsa.com/data-tiles/usdm
+          EVENT: ${{ github.event_name }}
+          FORCE: ${{ inputs.force }}
+          SCRIPTS: ${{ inputs.scripts }}
+        run: |
+          set -uo pipefail
+
+          # Code changes, an explicit force, and any run that is not the plain
+          # weekly USDM all go straight through.
+          if [ "$EVENT" = push ] || [ "${FORCE:-false}" = true ] \
+             || { [ -n "${SCRIPTS:-}" ] && [ "${SCRIPTS:-}" != usdm.R ]; }; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Newest USDM Tuesday at least two days old — mirrors usdm_get_dates().
+          wk=
+          for i in $(seq 2 15); do
+            d=$(date -u -d "$i days ago" +%F)
+            if [ "$(date -u -d "$d" +%u)" = 2 ]; then wk="$d"; break; fi
+          done
+
+          # `--retry` writes %{http_code} once per attempt, so keep the last one.
+          probe() {
+            curl -sS -o /dev/null -w '%{http_code}' --max-time 30 --retry 3 \
+              -I "$1" 2>/dev/null | tail -c 3
+          }
+
+          up=$(probe "$UPSTREAM/USDM_$wk.parquet")
+          mine=$(probe "$MINE/USDM_$wk.topojson")
+          echo "week=$wk upstream=$up mine=$mine"
+
+          lvl=notice
+          if [ "$EVENT" = workflow_dispatch ]; then lvl=warning; fi
+
+          if [ "$up" = 404 ]; then
+            echo "::${lvl}::Upstream usdm parquet for $wk is not published yet; skipping."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          elif [ "$up" = 200 ] && [ "$mine" = 200 ]; then
+            echo "::notice::$wk is already in this archive; skipping."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  update:
+    needs: precheck
+    if: needs.precheck.outputs.proceed == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 350
+    env:
+      S3_BUCKET: sustainable-fsa
+      S3_PREFIX: data-tiles
+      AWS_REGION: us-west-2
+      CLOUDFRONT_DISTRIBUTION_ID: E1BNL6ONVN84RI
+      CLOUDFRONT_BASE: https://data.sustainable-fsa.com
+      SCRIPTS: ${{ inputs.scripts || 'usdm.R' }}
+    steps:
+      - uses: mt-climate-office/actions/setup-geospatial@v1
+
+      # NEW RUNNER DEPENDENCY, and the reason this workflow is not just a copy
+      # of census-counties'. usdm.R shells out to the mapshaper CLI for the
+      # TopoJSON encode; no other archive in the project does — dd17/dd22 run
+      # mapshaper only on a developer's machine. rmapshaper's R functions do not
+      # cover it: they run the bundled V8 build, and `-o format=topojson
+      # quantization=...` is a CLI invocation.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install mapshaper
+        run: |
+          npm install -g mapshaper@0.6.113   # the version the gates were calibrated against
+          mapshaper -v
+
+      # Only the tiling scripts need it, and brew-installing it on every weekly
+      # USDM run would be minutes of nothing.
+      - name: Install tippecanoe
+        if: env.SCRIPTS != 'usdm.R'
+        run: |
+          brew install tippecanoe
+          tippecanoe --version
+
+      - name: Configure AWS credentials (GitHub OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::202533506375:role/sustainable-fsa-github-actions
+          aws-region: us-west-2
+          role-duration-seconds: 14400
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      # The transform is the thing everything else registers against, so it is
+      # gated before anything is built, not after something is published.
+      # check-registration is pure arithmetic against a frozen reference table,
+      # so it is cheap and offline and runs every time.
+      - name: Gate the transform
+        run: Rscript tools/check-registration.R
+
+      # check-constants re-downloads cb_2020_us_state_20m from Census to prove
+      # the frozen AlbersUSA layout still matches upstream. That is a network
+      # dependency worth having when the code changed and worth NOT having in a
+      # weekly cron, where a Census outage would fail a run that touches none of
+      # it. The constants cannot drift on their own; only an edit moves them.
+      - name: Gate the frozen constants
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: Rscript tools/check-constants.R
+
+      - name: Update archive
+        env:
+          # GitHub's macOS runners are small; usdm.R would otherwise ask for
+          # detectCores() - 2. A weekly run builds one week, so this only
+          # matters on a forced full rebuild.
+          WORKERS: '3'
+        run: |
+          set -euo pipefail
+          for s in $SCRIPTS; do
+            echo "::group::$s"
+            Rscript "$s"
+            echo "::endgroup::"
+          done
+
+      - name: Gate the published USDM
+        if: contains(env.SCRIPTS, 'usdm.R')
+        env:
+          SAMPLE: '6'
+        run: Rscript tools/check-usdm.R

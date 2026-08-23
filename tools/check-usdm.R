@@ -38,13 +38,23 @@ stopifnot(dir.exists(DIR), file.exists(f_index))
 idx <- jsonlite::fromJSON(f_index)
 
 ## ── The index describes what is actually there ───────────────────────────────
+## EVERY LOCAL FILE MUST BE IN THE INDEX, and that is the direction that matters:
+## the failure worth catching is an index that forgot weeks the archive holds.
+## The reverse is normal and not an error — a CI runner builds one week and
+## mirrors nothing else, so the index legitimately names 1,389 weeks it has no
+## file for. Only a full local mirror can assert equality, and it is told so.
 on_disk <- sort(sub("\\.topojson$", "", sub("^USDM_", "",
              list.files(DIR, pattern = "^USDM_.*\\.topojson$"))))
-if (!identical(sort(idx$dates), on_disk)) {
-  stop("check-usdm: the index and the directory disagree.\n",
-       "  in the index only: ", length(setdiff(idx$dates, on_disk)),
-       "   on disk only: ", length(setdiff(on_disk, idx$dates)), call. = FALSE)
-}
+missing <- setdiff(on_disk, idx$dates)
+if (length(missing))
+  stop("check-usdm: ", length(missing), " week(s) on disk are absent from the index",
+       " — e.g. ", paste(head(missing, 5), collapse = ", "),
+       "\n  an index that forgets a published week is the failure this catches.",
+       call. = FALSE)
+unmirrored <- setdiff(idx$dates, on_disk)
+if (length(unmirrored))
+  cat(sprintf("  (%d indexed week(s) not mirrored locally — sampling the %d that are)\n",
+              length(unmirrored), length(on_disk)))
 if (!identical(idx$space, SFSA_SPACE))
   stop("check-usdm: index space is '", idx$space, "', expected ", SFSA_SPACE, call. = FALSE)
 cat(sprintf("index: %d weeks, %s .. %s, quantization %g\n",
@@ -52,6 +62,8 @@ cat(sprintf("index: %d weeks, %s .. %s, quantization %g\n",
 
 ## Spread the sample across the archive rather than taking the first N — a fault
 ## that only touches the sparse early years would hide behind a head().
+if (!length(on_disk))
+  stop("check-usdm: no USDM_*.topojson in ", DIR, call. = FALSE)
 pick <- on_disk[unique(round(seq(1, length(on_disk), length.out = min(SAMPLE, length(on_disk)))))]
 
 b <- DUMMY$bounds

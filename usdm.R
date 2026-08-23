@@ -133,6 +133,15 @@ message(length(dates), " week(s) in scope")
 ## LISTING decides it"), and it is right about publishing.
 f_for <- function(d) file.path("usdm", sprintf("USDM_%s.topojson", d))
 
+## What the bucket already holds, read once and used twice: to decide what still
+## needs uploading, and to build an index that names the ARCHIVE rather than
+## this disk.
+published <- if (publish) {
+  grep("^USDM_.*\\.topojson$",
+       basename(s3_list_keys(s3_bucket, paste0(s3_prefix, "/usdm"))$Key),
+       value = TRUE)
+} else character(0)
+
 all_dates <- dates
 to_build  <- if (force) all_dates else all_dates[!file.exists(f_for(all_dates))]
 if (length(to_build) < length(all_dates))
@@ -296,7 +305,15 @@ if (length(out))
 ## Dates only, deliberately. Per-week drought classes would be redundant: the
 ## app reads the week it is displaying, and usdm-counties already publishes the
 ## weekly class statistics a timeline would need.
+##
+## IT NAMES EVERY WEEK IN THE ARCHIVE, NOT EVERY WEEK ON THIS DISK. A CI runner
+## builds one week and holds one file, so taking the list from the filesystem
+## alone would publish an index naming a single date and erase 1,390 — the
+## weekly cron quietly destroying the thing it exists to maintain. The bucket is
+## the authority; local files cover the PUBLISH=0 case, where there is no bucket
+## to ask.
 built <- sort(unique(c(
+  date_of(published),
   date_of(list.files("usdm", pattern = "\\.topojson$")),
   vapply(out, `[[`, "", "date"))))
 idx <- list(
@@ -315,9 +332,8 @@ message("index: ", length(built), " week(s), ", round(file.size(f_index) / 1024)
 
 ## ── Publish ──────────────────────────────────────────────────────────────────
 if (publish) {
-  have   <- basename(s3_list_keys(s3_bucket, paste0(s3_prefix, "/usdm"))$Key)
   to_pub <- if (force) all_dates
-            else all_dates[!basename(f_for(all_dates)) %in% have]
+            else all_dates[!basename(f_for(all_dates)) %in% published]
   message("publishing ", length(to_pub), " of ", length(all_dates), " week(s)",
           if (length(to_pub) < length(all_dates))
             sprintf(" (%d already in the bucket)", length(all_dates) - length(to_pub)) else "")
