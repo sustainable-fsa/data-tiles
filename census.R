@@ -332,7 +332,10 @@ if (publish) {
   ## missing upstream.
   to_pub <- if (force) vintages else vintages[!vapply(vintages, archived, logical(1))]
   message("publishing ", length(to_pub), " of ", length(vintages), " vintage(s)")
-  files <- unlist(lapply(to_pub, artifacts_for))
+  ## unlist(list()) is NULL, not character(0), and file.exists(NULL) is an
+  ## error rather than logical(0) — so the nothing-to-publish case, which is
+  ## every quiet week, needs the empty vector spelled out.
+  files <- if (length(to_pub)) unlist(lapply(to_pub, artifacts_for)) else character(0)
   ## to_build covered exactly the not-archived-and-not-local vintages, so every
   ## file here exists by now. Assert it rather than discovering a gap mid-upload.
   stopifnot(all(file.exists(files)))
