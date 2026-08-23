@@ -11,6 +11,7 @@ counties.R            FSA county tiles (dd17/dd22) + composite
 census.R              vintage-matched Census county tiles, 18 vintages
 fsa-lfp-counties.R    the NDMC/FSA LFP determination boundaries
 R/dummy-space.R       the AlbersUSA shift and dummy-space transform
+R/outline.R           the dissolved national outline and its pinhole guard
 R/s3-archive.R        vendored shared S3 helpers
 tools/                the four gates
 build/  tiles/        intermediates and PMTiles output
@@ -30,12 +31,10 @@ choropleth has to be drawn on the polygons its numbers came from.
 | `census.R` | `census-counties-<year>` × 18 | `census-counties` `data/clipped/` | **upstream**, each vintage's own cb |
 | `fsa-lfp-counties.R` | `fsa-lfp-counties` | `fsa-lfp-counties` (FOIA) | **not at all** — see below |
 
-Every one of them lands in `sfsa-albers-usa/1`, drops the same six territory
-FIPS, carries `id` / `state` / `county` string properties, and publishes an
-`-index.json` sidecar. `counties.R` and `fsa-lfp-counties.R` additionally
-publish a `states` innerlines layer inside the PMTiles and an
-`-outline-dummy.geojson`; the census vintages have neither, so their sidecar's
-`tiles.layers` lists `counties` alone.
+All three now publish the same shape: a `counties` layer and a `states`
+innerlines layer inside the PMTiles, an `-index.json` sidecar and an
+`-outline-dummy.geojson`. Every one lands in `sfsa-albers-usa/1`, drops the same
+six territory FIPS, and carries `id` / `state` / `county` string properties.
 
 The census sidecars carry two fields the others do not: `vintage`, the boundary
 year as a string, and **`mask_year`, the coastline the geometry was actually cut
@@ -178,8 +177,8 @@ it wrote".
 
 ## Open threads
 
-1. **Published 2026-08-22** to `s3://sustainable-fsa/data-tiles/tiles/`, 45
-   objects / 1.29 GB, verified over the CDN: correct content types, HTTP 206 on
+1. **Published 2026-08-22** to `s3://sustainable-fsa/data-tiles/tiles/`, 63
+   objects / 1.39 GB, verified over the CDN: correct content types, HTTP 206 on
    a range request, and no `Content-Encoding` on the PMTiles (which would break
    Range semantics — the header records `tile_compression = gzip` and the client
    shim decompresses).
@@ -195,11 +194,16 @@ it wrote".
    `s3_write_manifest()` + `cf_invalidate()`. None of them did, so the first
    publish went up unlisted and `_manifest.txt` had to be written by hand. The
    invalidation uses `/<prefix>/tiles/*`, which counts as a single path.
-2. **The census vintages have no `states` mesh layer and no outline.** The
-   sidecars landed 2026-08-22; these two did not. `counties.R` precomputes the
-   mesh with `ms_innerlines()` because MVT has no mesh operation, and publishes
-   the outline because the USDM pipeline clips against it. Adding both to
-   `census.R` means re-tiling all eighteen, ~30 minutes.
+2. **`counties.R` still inlines a bare `st_union()` for its outline** where
+   `census.R` and `fsa-lfp-counties.R` now call `dissolve_outline()`. dd17/dd22
+   happen to carry no pinholes, so the two agree by luck rather than by
+   construction — adopt the helper the next time those are rebuilt.
+3. **`immutable` is the wrong cache policy for a filename that gets revised.**
+   Twice now the census PMTiles have been republished under the same names, and
+   only because nothing consumes them yet. `max-age=31536000, immutable` means
+   an edge invalidation does not reach a browser that already holds the file. If
+   these tilesets are still in flux, either shorten the max-age or put a content
+   hash in the filename before anyone starts consuming them.
 
 ## Related
 

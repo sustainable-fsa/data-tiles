@@ -38,6 +38,7 @@ suppressPackageStartupMessages({
   library(rmapshaper); library(jsonlite)
 })
 source("R/dummy-space.R")
+source("R/outline.R")
 source("R/s3-archive.R")
 sf::sf_use_s2(FALSE)
 options(tigris_use_cache = TRUE)
@@ -156,50 +157,11 @@ rmapshaper::ms_innerlines(states_g) |>
                layer_options = c("COORDINATE_PRECISION=9", "RFC7946=NO"))
 
 ## ── The national outline ─────────────────────────────────────────────────────
-## Published because the USDM pipeline clips against it: the NDMC's own
-## coastline is ~1:2,000,000 and would spill past the counties otherwise.
-##
-## AN ENCLOSED RING HERE IS NOT WATER. These counties are not edge-matched, so
-## the union leaves 491 pinholes where neighbours fail to meet — 0.2 km2 in
-## total against 9,323,313, median 0.06 m2, the largest 0.19 km2, and none of
-## them a lake. Left in, every one punches a hole through the layer this outline
-## exists to clip. Dropped the way census-counties drops them, with the same
-## guard rather than a blanket fill: a ring big enough to be real water is kept
-## and announced. (The gaps themselves stay in the counties layer. They are in
-## the record, and this repo does not edit the record — it only declines to
-## publish them as coastline.)
-MAX_HOLE_M2 <- 1e6
-
-## Ring area via a CRS-less st_polygon, deliberately: x is LABELLED EPSG:4326
-## and st_area() would read that label and return geodesic metres off dummy
-## degrees, which are not degrees. Planar deg2 scaled by deg_m is the only
-## honest reading.
-ring_m2 <- function(r) {
-  abs(as.numeric(sf::st_area(sf::st_polygon(list(r))))) * DUMMY$deg_m^2
-}
-
-dropped <- 0L
-kept    <- numeric(0)
-parts <- lapply(sf::st_cast(sf::st_union(x), "MULTIPOLYGON")[[1]], function(pp) {
-  if (length(pp) == 1L) return(pp)
-  a   <- vapply(pp[-1], ring_m2, numeric(1))
-  big <- a > MAX_HOLE_M2
-  dropped <<- dropped + sum(!big)
-  kept    <<- c(kept, a[big])
-  pp[c(TRUE, big)]
-})
-outline <- sf::st_sfc(sf::st_multipolygon(parts), crs = 4326)
-message(sprintf("  outline: %d parts, %d pinholes dropped, %d rings kept",
-                length(parts), dropped, length(kept)))
-if (length(kept))
-  message(sprintf("    kept ring > %.0f km2: %s", MAX_HOLE_M2 / 1e6,
-                  paste(sprintf("%.2f km2", kept / 1e6), collapse = ", ")))
-
+## R/outline.R carries the rationale: these counties are not edge-matched, so
+## the union leaves 491 pinholes where neighbours fail to meet, and every one
+## would punch a hole through the layer this outline exists to clip.
 f_outline <- file.path("tiles", "fsa-lfp-counties-outline-dummy.geojson")
-outline |>
-  sf::st_sf(geometry = _) |>
-  sf::st_write(f_outline, driver = "GeoJSON", delete_dsn = TRUE, quiet = TRUE,
-               layer_options = c("COORDINATE_PRECISION=9", "RFC7946=NO"))
+write_outline(dissolve_outline(x), f_outline)
 
 ## ── The index sidecar ────────────────────────────────────────────────────────
 ## Same schema as the dd17/dd22 sidecars, and a hard requirement for the same

@@ -58,6 +58,7 @@ counties.R                   FSA county tiles (dd17/dd22)
 census.R                     vintage-matched Census county tiles, 18 vintages
 fsa-lfp-counties.R           the NDMC/FSA LFP determination boundaries
 R/dummy-space.R              the ONLY copy of the transform
+R/outline.R                  the dissolved outline and its pinhole guard
 tools/check-registration.R   gate G4 — proves it matches the JavaScript
 tools/check-coverage.R       proves no county was silently dropped
 ```
@@ -100,12 +101,17 @@ centre-only test and be 765 m out at the edges.
 [`_manifest.txt`](https://data.sustainable-fsa.com/data-tiles/_manifest.txt):
 
 ```
-census-counties-<year>.pmtiles        2000, 2009, 2010, 2011-2025
-census-counties-<year>-index.json
-fsa-lfp-counties.pmtiles              + -index.json, -outline-dummy.geojson
-fsa-counties-dd17.pmtiles             + -index.json, -outline-dummy.geojson
-fsa-counties-dd22.pmtiles             + -index.json, -outline-dummy.geojson
+census-counties-<year>.pmtiles   2000, 2009, 2010, 2011-2025
+fsa-lfp-counties.pmtiles
+fsa-counties-dd17.pmtiles
+fsa-counties-dd22.pmtiles
 ```
+
+Each `.pmtiles` carries a `counties` layer and a `states` innerlines layer, and
+ships with a `-index.json` sidecar and a `-outline-dummy.geojson` beside it. The
+sidecar is not an optimisation: `queryRenderedFeatures` returns only what is
+rendered, clipped and simplified for the zoom, so the tiles alone cannot supply
+a county index, county names or a centroid.
 
 PMTiles are served `application/octet-stream` with **no `Content-Encoding`**:
 the header records `tile_compression = gzip` and the client shim decompresses,

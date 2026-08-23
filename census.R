@@ -31,9 +31,11 @@
 ## =============================================================================
 
 suppressPackageStartupMessages({
-  library(sf); library(arrow); library(dplyr); library(tigris); library(jsonlite)
+  library(sf); library(arrow); library(dplyr); library(tigris)
+  library(rmapshaper); library(jsonlite)
 })
 source("R/dummy-space.R")
+source("R/outline.R")
 source("R/s3-archive.R")
 sf::sf_use_s2(FALSE)
 options(tigris_use_cache = TRUE)
@@ -163,13 +165,39 @@ build_vintage <- function(y) {
   sf::st_crs(x) <- 4326                    # writer-boundary label; see counties.R
   x$year <- y
 
-  f_geo <- file.path("build", sprintf("census-%d.geojsonl", y))
+  ## ── Layer 1: the counties ─────────────────────────────────────────────────
+  ## COORDINATE_PRECISION=9 is explicit: GDAL's GeoJSON writer defaults to 7,
+  ## which happens to be fine here (1e-7 dummy degrees is 5 cm) but only by
+  ## luck. RFC7946=NO because these are not real lng/lat and must not be
+  ## normalised as such.
+  f_counties <- file.path("build", sprintf("census-%d-counties.geojsonl", y))
   x |> dplyr::select(id, state, county, year) |>
-    sf::st_write(f_geo, driver = "GeoJSONSeq", delete_dsn = TRUE, quiet = TRUE,
+    sf::st_write(f_counties, driver = "GeoJSONSeq", delete_dsn = TRUE, quiet = TRUE,
                  layer_options = c("COORDINATE_PRECISION=9", "RFC7946=NO"))
   nv <- nrow(sf::st_coordinates(x))
   message(sprintf("  vertices: %s   geojsonl %.0f MB", format(nv, big.mark = ","),
-                  file.size(f_geo) / 1048576))
+                  file.size(f_counties) / 1048576))
+
+  ## ── Layer 2: the state mesh ───────────────────────────────────────────────
+  ## Precomputed because there is no mesh operation in a vector tile: the kit
+  ## derives this client-side with topojson.mesh() and MVT has no equivalent.
+  ## Dissolved by the state FIPS the data carries, not by substr(id) — same
+  ## answer here, but the column is the honest source.
+  f_states <- file.path("build", sprintf("census-%d-states.geojsonl", y))
+  states_g <- x |>
+    dplyr::group_by(stfips) |>
+    dplyr::summarise(.groups = "drop") |>
+    sf::st_make_valid()
+  rmapshaper::ms_innerlines(states_g) |>
+    sf::st_write(f_states, driver = "GeoJSONSeq", delete_dsn = TRUE, quiet = TRUE,
+                 layer_options = c("COORDINATE_PRECISION=9", "RFC7946=NO"))
+  message("  states: ", nrow(states_g), " dissolved")
+
+  ## ── The national outline ──────────────────────────────────────────────────
+  ## Vintage-matched like everything else here: the USDM week that clips against
+  ## this one has to clip against the coastline of its own year.
+  f_outline <- file.path("tiles", sprintf("census-counties-%d-outline-dummy.geojson", y))
+  write_outline(dissolve_outline(x), f_outline)
 
   ## ── The index sidecar ─────────────────────────────────────────────────────
   ## Same schema as the dd17/dd22 and fsa-lfp-counties sidecars, and a hard
@@ -196,9 +224,8 @@ build_vintage <- function(y) {
       minzoom  = jsonlite::unbox(0L),
       maxzoom  = jsonlite::unbox(MAXZOOM),
       extent   = jsonlite::unbox(8192L),
-      ## One layer, unlike dd17/dd22 and fsa-lfp-counties: these vintages carry
-      ## no precomputed state mesh.
-      layers   = list(counties = jsonlite::unbox("counties"))
+      layers   = list(counties = jsonlite::unbox("counties"),
+                      states   = jsonlite::unbox("states"))
     ),
     counties     = x$id,
     county_names = x$county,
@@ -219,7 +246,8 @@ build_vintage <- function(y) {
     sprintf("--description=%s - tl_%d geometry clipped to the cb %d 500k waterline. NOT a geographic CRS.",
             SFSA_SPACE, y, mask_year),
     "--attribution=U.S. Census Bureau TIGER/Line; Sustainable FSA archive",
-    sprintf("--layer=counties"), f_geo,
+    sprintf("--named-layer=counties:%s", f_counties),
+    sprintf("--named-layer=states:%s", f_states),
     "--minimum-zoom=0", sprintf("--maximum-zoom=%d", MAXZOOM),
     sprintf("--full-detail=%d", DETAIL),
     sprintf("--simplification=%s", format(SIMPLIFY)),
@@ -235,7 +263,8 @@ build_vintage <- function(y) {
   message(sprintf("  %s: %.1f MB", basename(f_pm), file.size(f_pm) / 1048576))
 
   list(year = y, mask_year = mask_year, n = nrow(x), vertices = nv,
-       pmtiles = f_pm, index = f_index, bytes = file.size(f_pm))
+       pmtiles = f_pm, index = f_index, outline = f_outline,
+       bytes = file.size(f_pm))
 }
 
 out <- lapply(vintages, build_vintage)
@@ -255,6 +284,11 @@ if (publish) {
            key = paste0(s3_prefix, "/tiles/", basename(o$index)),
            file = o$index,
            content_type = "application/json",
+           cache_control = "max-age=3600")
+    s3_put(bucket = s3_bucket,
+           key = paste0(s3_prefix, "/tiles/", basename(o$outline)),
+           file = o$outline,
+           content_type = "application/geo+json",
            cache_control = "max-age=3600")
   }
 
