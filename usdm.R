@@ -142,11 +142,23 @@ published <- if (publish) {
        value = TRUE)
 } else character(0)
 
+## A week the bucket already has needs neither building nor publishing; a week
+## it lacks needs building only if this machine does not already hold the file.
+## Both halves matter and each was wrong on its own: keying the BUILD off the S3
+## listing alone made a machine holding all 1,390 weeks rebuild every one just to
+## upload, and keying it off local files alone made a CI runner — which clones a
+## repo where usdm/ is gitignored, so it holds NOTHING — rebuild the entire
+## archive to add one week.
 all_dates <- dates
-to_build  <- if (force) all_dates else all_dates[!file.exists(f_for(all_dates))]
+wanted <- if (force || !publish) {
+  all_dates
+} else {
+  all_dates[!basename(f_for(all_dates)) %in% published]
+}
+to_build <- if (force) all_dates else wanted[!file.exists(f_for(wanted))]
 if (length(to_build) < length(all_dates))
   message("  ", length(all_dates) - length(to_build),
-          " already built locally, skipping (FORCE=1 to rebuild)")
+          " week(s) already archived or built, skipping (FORCE=1 to rebuild)")
 
 ## ── One week ─────────────────────────────────────────────────────────────────
 build_week <- function(d) {
