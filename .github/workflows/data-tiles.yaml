@@ -15,6 +15,14 @@
 # unconditionally, and their sources are frozen archives that change only when
 # someone re-runs a FOIA or a boundary release; reach them with the `scripts`
 # input.
+#
+# TWO FAMILIES, ONE NESTED LOOP. Every script takes SPACE=dummy|geo and builds
+# exactly one space per invocation, so the update step iterates SCRIPTS x SPACES.
+# SPACES lands as `dummy`: the geographic family's 1,390 USDM weeks have to be
+# backfilled by hand first, or the Thursday after this file merged would try to
+# build the lot inside a 350-minute timeout. It flips to `dummy geo` in its own
+# commit once the backfill is published, after which a quiet Thursday costs four
+# list calls instead of two.
 name: update
 run-name: Update the data-tiles archive → S3
 
@@ -32,6 +40,13 @@ on:
           "counties.R" or "fsa-lfp-counties.R" to rebuild a frozen tileset.
         type: string
         default: usdm.R census.R
+      spaces:
+        description: >-
+          Space-separated coordinate spaces. "dummy" is the published
+          sfsa-albers-usa/1 family, "geo" its true-EPSG:4326 sibling; every
+          script named above runs once per space.
+        type: string
+        default: dummy
   schedule:
     # Thursdays, 21:00 UTC — behind the whole USDM cascade. usdm publishes at
     # 13:00 (14:45 in winter) and usdm-counties at 20:20, so by 21:00 the week
@@ -128,6 +143,7 @@ jobs:
       CLOUDFRONT_DISTRIBUTION_ID: E1BNL6ONVN84RI
       CLOUDFRONT_BASE: https://data.sustainable-fsa.com
       SCRIPTS: ${{ inputs.scripts || 'usdm.R census.R' }}
+      SPACES: ${{ inputs.spaces || 'dummy' }}
     steps:
       - uses: mt-climate-office/actions/setup-geospatial@v1
 
@@ -146,6 +162,43 @@ jobs:
         run: |
           npm install -g mapshaper@0.6.113
           mapshaper -v
+
+      # THE CRAN sf BINARY REPRODUCES NOTHING IN THIS REPO BYTE-IDENTICALLY, so
+      # what sf links against is not a detail of the runner. It bundles GDAL
+      # 3.8.5 and PROJ 9.5.1 with no datum grids and no Parquet driver — and
+      # every transform here crosses NAD83 <-> WGS84 (dummy-space hops through
+      # ESRI:102003, census.R reads EPSG:4269). With no grid PROJ falls through
+      # to the ballpark +proj=noop and lands 0.6-2.3 m off: no error, no
+      # warning, tiles that look right and misregister against everything
+      # already published.
+      #
+      # setup-geospatial does not install that binary. r-base, r-sf, gdal, geos
+      # and proj all come from conda-forge, and libgdal-arrow-parquet supplies
+      # the driver usdm.R reads each week's parquet through. But conda-forge
+      # ships proj WITHOUT proj-data and its activation script sets
+      # PROJ_NETWORK=ON in its place, so the grids arrive from cdn.proj.org per
+      # run and are not in the action's env cache. THAT is what this gate is
+      # for: a PROJ CDN outage silently demotes every transform to noop and the
+      # build still succeeds. (-96, 29.5) moves 0.612 m on the audited stack —
+      # GDAL 3.13.3 / GEOS 3.14.1 / PROJ 9.8.1, sf built from source — and
+      # exactly 0 m under noop, so the floor is what discriminates and the
+      # ceiling only catches nonsense.
+      - name: Gate the R geospatial stack
+        run: |
+          Rscript -e 'v <- sf::sf_extSoftVersion()
+            stopifnot(
+              "GDAL predates the audited stack" =
+                numeric_version(v[["GDAL"]]) >= "3.9",
+              "no Parquet driver - this is the CRAN sf binary" =
+                "Parquet" %in% rownames(sf::st_drivers()))
+            d <- as.numeric(sf::st_distance(
+              sf::st_transform(sf::st_sfc(sf::st_point(c(-96, 29.5)), crs = 4269), 4326),
+              sf::st_sfc(sf::st_point(c(-96, 29.5)), crs = 4326)))
+            cat(sprintf("GDAL %s / GEOS %s / PROJ %s; NAD83->WGS84 at (-96, 29.5) moves %.4f m (0.6121 audited)\n",
+                        v[["GDAL"]], v[["GEOS"]], v[["PROJ"]], d))
+            stopifnot(
+              "NAD83->WGS84 is a noop - no datum grid reached this runner" = d > 0.1,
+              "NAD83->WGS84 moved more than 5 m - wrong pipeline entirely" = d < 5)'
 
       - name: Configure AWS credentials (GitHub OIDC)
         uses: aws-actions/configure-aws-credentials@v6
@@ -182,13 +235,25 @@ jobs:
         run: |
           set -euo pipefail
           for s in $SCRIPTS; do
-            echo "::group::$s"
-            Rscript "$s"
-            echo "::endgroup::"
+            for sp in $SPACES; do
+              echo "::group::$s ($sp)"
+              SPACE=$sp Rscript "$s"
+              echo "::endgroup::"
+            done
           done
 
+      # One gate per space, because they read different names, a different index
+      # and a different bounds box, and check-usdm.R takes one space per
+      # invocation for the same reason usdm.R does.
       - name: Gate the published USDM
-        if: contains(env.SCRIPTS, 'usdm.R')
+        if: contains(env.SCRIPTS, 'usdm.R') && contains(env.SPACES, 'dummy')
         env:
+          SAMPLE: '6'
+        run: Rscript tools/check-usdm.R
+
+      - name: Gate the published USDM (geographic)
+        if: contains(env.SCRIPTS, 'usdm.R') && contains(env.SPACES, 'geo')
+        env:
+          SPACE: geo
           SAMPLE: '6'
         run: Rscript tools/check-usdm.R
