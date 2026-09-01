@@ -35,8 +35,18 @@
 ## -outline-dummy.geojson is active. This repo does the projection, not the
 ## editing.
 ##
-##   DATES=2025-09-16 PUBLISH=0 Rscript usdm.R    # one week
-##   FORCE=1 WORKERS=4 Rscript usdm.R             # rebuild everything
+## TWO SPACES, ONE PER INVOCATION. SPACE=dummy, the default, writes
+## USDM_<date>.topojson in sfsa-albers-usa/1. SPACE=geo writes
+## USDM_<date>-geo.topojson in true EPSG:4326 (R/geo-space.R), which renders on
+## a stock MapLibre style including globe. The geo path has no insets, so the
+## per-region area gate that guards the shift has nothing to say about it and is
+## replaced by a per-class area gate against the source; everything downstream of
+## the projection — mapshaper, the round-trip retention gate, the object-name
+## check, the .partial rename — is the same code for both.
+##
+##   DATES=2025-09-16 PUBLISH=0 Rscript usdm.R           # one week
+##   FORCE=1 WORKERS=4 Rscript usdm.R                    # rebuild everything
+##   SPACE=geo DATES=2025-09-16 PUBLISH=0 Rscript usdm.R # one geo week
 ## =============================================================================
 
 suppressPackageStartupMessages({
@@ -61,7 +71,12 @@ message("space: ", SPACE)
 ## 4.6 x 3.1 m on the ground, which retains 99.75% of source vertices — lossless
 ## against a 1:2M product. 1e5 (46 m, 92.1%) and 1e4 (461 m, 50.1%) are
 ## simplification wearing an encoding's clothes, so they are not options here.
-QUANTIZATION <- "1e6"
+##
+## THE TWO SPACES CANNOT SHARE THE NUMBER. mapshaper's quantization is
+## bbox-relative: the same q over a geo week's ~115-degree bbox is a ~13 m grid,
+## which is exactly what 1e5 was rejected for. The geo value and its arithmetic
+## live in R/geo-space.R.
+QUANTIZATION <- if (SPACE == "geo") GEO_QUANTIZATION else "1e6"
 
 ## Topology building is LEFT ON, having been measured rather than assumed:
 ## mapshaper snaps coincident vertices on GeoJSON import, and that snap is what
@@ -100,6 +115,15 @@ MIN_VERTEX_RETENTION <- 0.99
 ## quietly eating more than the 0.85 km2 of ocean-drape D0 it is known to.
 AREA_RATIO <- c("00" = 1, "02" = 0.25, "15" = 2.25, "72" = 6.25)
 AREA_TOL   <- 0.01
+
+## The geo path's gate, and it asks a different question. There are no insets, so
+## the expectation is equality rather than a ratio, and it is measured PER
+## DROUGHT CLASS in EPSG:6933 against the same class in the source: a class is
+## the unit the app draws, and one lost to a dissolve or a wrap would otherwise
+## hide inside a national total. The slack is the make_valid and dissolve residue
+## on a hand-drawn 1:2,000,000 boundary, not a projection allowance —
+## R/geo-space.R's own assert already holds the wrap to 1e-6.
+GEO_AREA_TOL <- 1e-4
 
 USDM_ARCHIVE <- Sys.getenv("USDM_ARCHIVE",
                            unset = "https://data.sustainable-fsa.com/usdm")
@@ -148,7 +172,7 @@ message(length(dates), " week(s) in scope")
 ## locally, so it does both, which is the case the S3-listing rule was written
 ## for — usdm.R in the source archive is the model ("membership in the S3
 ## LISTING decides it"), and it is right about publishing.
-f_for <- function(d) file.path("usdm", sprintf("USDM_%s.topojson", d))
+f_for <- function(d) file.path("usdm", sprintf("USDM_%s%s.topojson", d, SUFFIX))
 
 ## What the bucket already holds, read once and used twice: to decide what still
 ## needs uploading, and to build an index that names the ARCHIVE rather than
@@ -185,11 +209,55 @@ if (length(to_build) < length(all_dates))
 
 ## ── One week ─────────────────────────────────────────────────────────────────
 build_week <- function(d) {
-  f_geo <- file.path("build", "usdm", sprintf("USDM_%s.geojson", d))
-  f_out <- file.path("usdm", sprintf("USDM_%s.topojson", d))
+  f_geo <- file.path("build", "usdm", sprintf("USDM_%s%s.geojson", d, SUFFIX))
+  f_out <- file.path("usdm", sprintf("USDM_%s%s.topojson", d, SUFFIX))
 
   x <- sf::read_sf(sprintf("%s/data/parquet/USDM_%s.parquet", USDM_ARCHIVE, d))
   nv_src <- nrow(sf::st_coordinates(x))
+
+  if (SPACE == "geo") {
+  ## NO EXPLODE, NO REGIONS. The source is already true-position EPSG:4326 and
+  ## nothing is being moved, so the classifier the dummy branch needs — and the
+  ## per-region ratio gate that guards its unpadded Hawaii clip — have nothing to
+  ## do here. What is left is a dissolve to five features and to_geo().
+  ##
+  ## st_make_valid() FIRST, and on the source rather than after the dissolve:
+  ## these polygons are hand-drawn at ~1:2,000,000 and the dissolve is a union,
+  ## which is where an invalid ring turns into a lost part rather than an error.
+  g <- x |>
+    sf::st_make_valid() |>
+    dplyr::group_by(date, usdm_class) |>
+    dplyr::summarise(.groups = "drop")
+
+  ## The gate: EPSG:6933 area per drought class, output against source. Measured
+  ## before the transform and after it, on the same classes, because the classes
+  ## are the only structure this file has — five features, no ids — and a class
+  ## that lost a part to a union or a wrap is invisible in a national total.
+  a_src <- vapply(split(seq_len(nrow(x)), x$usdm_class),
+                  function(i) geo_area_m2(x[i, ]), numeric(1))
+
+  g <- to_geo(g)
+
+  a_out <- vapply(split(seq_len(nrow(g)), g$usdm_class),
+                  function(i) geo_area_m2(g[i, ]), numeric(1))
+  for (k in names(a_src)) {
+    got <- if (k %in% names(a_out)) a_out[[k]] else 0
+    rel <- abs(got - a_src[[k]]) / a_src[[k]]
+    if (!is.finite(rel) || rel > GEO_AREA_TOL)
+      stop(sprintf(paste0("USDM %s: class %s changed area across the projection ",
+                          "by %.3e, tolerance %.0e.\n",
+                          "  source %.6f m2 (EPSG:6933)\n  output %.6f m2\n",
+                          "  A dissolve or a dateline wrap dropped part of a ",
+                          "class; the source ring is the place to look."),
+                   d, k, rel, GEO_AREA_TOL, a_src[[k]], got),
+           call. = FALSE)
+  }
+
+  ## to_geo() asserts this too. Restated because the dummy branch states it, and
+  ## an edit that moves the transform must not quietly take the gate with it.
+  assert_geo_envelope(g)
+
+  } else {
 
   ## EXPLODE FIRST. albers_usa_shift() classifies per FEATURE by bbox, so a
   ## continental MULTIPOLYGON matches Alaska first and the entire country lands
@@ -233,18 +301,27 @@ build_week <- function(d) {
   ## the lie stops at this boundary.
   sf::st_crs(g) <- 4326
 
-  ## nv_dummy, not nv_src: the dissolve legitimately drops a few hundred vertices
-  ## where exploded polygons met, and the gate below is about what MAPSHAPER did,
-  ## not about the dissolve.
-  nv_dummy <- nrow(sf::st_coordinates(g))
+  }
+
+  ## nv_out, not nv_src: the dummy dissolve legitimately drops a few hundred
+  ## vertices where exploded polygons met, and the gate below is about what
+  ## MAPSHAPER did, not about the dissolve.
+  nv_out <- nrow(sf::st_coordinates(g))
+
+  ## 9 dp was calibrated on DUMMY degrees, where a degree is 536,995 m and 9 dp
+  ## is half a micrometre — enough that the quantisation below is the only loss.
+  ## A geo degree is a real one, so 7 dp is 1.1 cm, two orders finer than the
+  ## quantisation grid and the last digit a 1:2,000,000 source can claim.
+  precision <- sprintf("COORDINATE_PRECISION=%d", if (SPACE == "geo") 7L else 9L)
   sf::st_write(g, f_geo, driver = "GeoJSON", delete_dsn = TRUE, quiet = TRUE,
-               layer_options = c("COORDINATE_PRECISION=9", "RFC7946=NO"))
+               layer_options = c(precision, "RFC7946=NO"))
 
   ## Built under a temporary name and renamed only once every gate has passed.
   ## A rejected week that left its file behind would be treated as done by the
   ## incremental skip on the next run — a bad artifact, published, silently.
   f_tmp <- paste0(f_out, ".partial")
-  f_rt  <- file.path("build", "usdm", sprintf("USDM_%s-roundtrip.geojson", d))
+  f_rt  <- file.path("build", "usdm",
+                     sprintf("USDM_%s%s-roundtrip.geojson", d, SUFFIX))
   on.exit(unlink(c(f_geo, f_tmp, f_rt)), add = TRUE)
 
   ## Flags match fsa-counties-dd17/dd22's own TopoJSON step
@@ -268,12 +345,12 @@ build_week <- function(d) {
                              shQuote(f_rt)), stdout = FALSE, stderr = FALSE) != 0)
     stop("mapshaper could not decode its own output for USDM ", d, call. = FALSE)
   nv_rt <- nrow(sf::st_coordinates(sf::read_sf(f_rt)))
-  if (nv_rt < MIN_VERTEX_RETENTION * nv_dummy)
+  if (nv_rt < MIN_VERTEX_RETENTION * nv_out)
     stop(sprintf(paste0("USDM %s: %s of %s vertices survived the TopoJSON round ",
                         "trip (%.3f%%, floor %.1f%%).\n  mapshaper snaps on ",
                         "import; this is what that looks like when it goes wrong."),
-                 d, format(nv_rt, big.mark = ","), format(nv_dummy, big.mark = ","),
-                 100 * nv_rt / nv_dummy, 100 * MIN_VERTEX_RETENTION), call. = FALSE)
+                 d, format(nv_rt, big.mark = ","), format(nv_out, big.mark = ","),
+                 100 * nv_rt / nv_out, 100 * MIN_VERTEX_RETENTION), call. = FALSE)
 
   topo <- jsonlite::fromJSON(f_tmp, simplifyVector = FALSE)
   if (!identical(names(topo$objects), "usdm"))
@@ -282,8 +359,8 @@ build_week <- function(d) {
   if (!file.rename(f_tmp, f_out))
     stop("could not place ", f_out, call. = FALSE)
 
-  list(date = d, classes = sort(unique(g$usdm_class)), vertices = nv_dummy,
-       retained = nv_rt / nv_dummy, arcs = length(topo$arcs),
+  list(date = d, classes = sort(unique(g$usdm_class)), vertices = nv_out,
+       retained = nv_rt / nv_out, arcs = length(topo$arcs),
        bytes = file.size(f_out), file = f_out)
 }
 
@@ -312,12 +389,16 @@ run_all <- function(ds) {
       suppressPackageStartupMessages({library(sf); library(dplyr); library(jsonlite)})
       setwd(wd)
       source("R/dummy-space.R")
+      source("R/geo-space.R")
       sf::sf_use_s2(FALSE)
     },
     wd = getwd(),
     USDM_ARCHIVE = USDM_ARCHIVE, QUANTIZATION = QUANTIZATION,
     MIN_VERTEX_RETENTION = MIN_VERTEX_RETENTION,
-    AREA_RATIO = AREA_RATIO, AREA_TOL = AREA_TOL
+    AREA_RATIO = AREA_RATIO, AREA_TOL = AREA_TOL,
+    ## build_week() reads both, and a daemon that inherited neither would build
+    ## the dummy week under the geo run's name.
+    SPACE = SPACE, SUFFIX = SUFFIX, GEO_AREA_TOL = GEO_AREA_TOL
   )
   mirai::mirai_map(ds, build_week)[.progress]
 }
@@ -347,6 +428,7 @@ if (length(out))
 ## weekly cron quietly destroying the thing it exists to maintain. The bucket is
 ## the authority; local files cover the PUBLISH=0 case, where there is no bucket
 ## to ask.
+##
 ## The local listing is anchored the same way the S3 one is, and for the same
 ## reason: this directory holds both families once the geo backfill has run.
 built <- sort(unique(c(
@@ -354,7 +436,24 @@ built <- sort(unique(c(
   date_of(list.files("usdm", pattern = sprintf(
     "^USDM_[0-9]{4}-[0-9]{2}-[0-9]{2}%s\\.topojson$", SUFFIX))),
   vapply(out, `[[`, "", "date"))))
-idx <- list(
+
+## One schema for both, because the fields are additive and `space` is what tells
+## them apart: a consumer that reads `space` gets everything it needs, and one
+## that ignores it was already reading the dummy family's numbers as if they were
+## degrees. The geo index carries `crs` for anyone who only wants the projection,
+## and `frame_bounds` rather than `bounds` — GEO_FRAME is a camera box, not the
+## extent of any week, and the per-week extent is in each TopoJSON's own bbox.
+idx <- if (SPACE == "geo") list(
+  schema       = jsonlite::unbox("sfsa-usdm-index/1"),
+  space        = jsonlite::unbox(GEO_SPACE),
+  crs          = jsonlite::unbox("EPSG:4326"),
+  quantization = jsonlite::unbox(as.numeric(QUANTIZATION)),
+  frame_bounds = as.numeric(GEO_FRAME[c("xmin", "ymin", "xmax", "ymax")]),
+  url          = jsonlite::unbox("USDM_{date}-geo.topojson"),
+  object       = jsonlite::unbox("usdm"),
+  n            = jsonlite::unbox(length(built)),
+  dates        = built
+) else list(
   schema       = jsonlite::unbox("sfsa-usdm-index/1"),
   space        = jsonlite::unbox(SFSA_SPACE),
   quantization = jsonlite::unbox(as.numeric(QUANTIZATION)),
@@ -364,7 +463,7 @@ idx <- list(
   n            = jsonlite::unbox(length(built)),
   dates        = built
 )
-f_index <- file.path("usdm", "usdm-index.json")
+f_index <- file.path("usdm", sprintf("usdm%s-index.json", SUFFIX))
 jsonlite::write_json(idx, f_index, auto_unbox = FALSE, digits = NA)
 message("index: ", length(built), " week(s), ", round(file.size(f_index) / 1024), " KB")
 
