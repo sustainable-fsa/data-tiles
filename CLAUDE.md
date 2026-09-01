@@ -313,3 +313,48 @@ it wrote".
   2025-FSA-08431-F), and the statistics computed on them,
   `sustainable-fsa/usdm-counties-fsa-lfp`.
 - The determinations these tiles illustrate: `sustainable-fsa/usdm-counties`.
+
+## Geo family (`SPACE=geo`): the calibration numbers, measured 2026-09-01
+
+WP5's measurements, parked here for WP7 to fold into the geo-family section.
+GDAL 3.13.3 / GEOS 3.14.1 / PROJ 9.8.1, mapshaper 0.6.113, every run
+`PUBLISH=0`. **Both constants in `R/geo-space.R` were confirmed, not revised.**
+
+**`GEO_MAXZOOM = 13L`.** dd22-geo and census-counties-2020-geo built at both
+zooms; deviation is `tippecanoe-decode` of the maxzoom tiles over Guam, American
+Samoa, a PR municipio, Pinellas FL and an Alaska borough, point-to-segment
+against the build's own geojsonl in the local UTM zone, with clip artefacts (the
+tile border and tippecanoe's 5/256 buffer rect) excluded.
+
+| maxzoom | per-axis quantum | worst deviation | dd22-geo | census-2020-geo |
+|---|---|---|---|---|
+| 13 | 0.30–0.58 m | **0.42 m** (PR) | 83.2 MB (1.35x dummy) | 88.4 MB (1.36x) |
+| 12 | 0.61–1.16 m | 0.82 m (PR) | 51.6 MB (0.84x) | 54.2 MB (0.84x) |
+
+The measured deviation is 0.71 of the quantum at both zooms — half a grid
+diagonal — so **only the per-axis quantum separates them**, and that is the
+number the ≤1 m bar was written against. County ids at z4/z6/z8 are complete at
+both zooms with one exception: **census-geo loses Rose Island (60030) at z4
+only**, a 1 km² atoll against z4's ~300 m grid. It is back at z6. A coverage
+gate that enumerates ids at z4 has to know that.
+
+**`GEO_QUANTIZATION = "1e7"`.** Weeks 2013-03-05, 2019-08-27 and 2025-09-16 (the
+archive's worst) at four values. Pitch is per file from its own
+`transform.scale`; `south` is at the bbox's southern edge, where a degree of
+longitude is longest and the grid is coarsest.
+
+| q | pitch x mid / south | pitch y | worst-week gz | worst retention |
+|---|---|---|---|---|
+| 1e6 | 8.1–9.0 / 10.0–11.7 m | 4.8–5.9 m | 0.570 MB | 0.9925 |
+| 2e6 | 4.0–4.5 / 5.0–5.9 m | 2.4–2.9 m | 0.644 MB | 0.9974 |
+| 5e6 | 1.6–1.8 / 2.0–2.3 m | 1.0–1.2 m | 0.758 MB | 0.9989 |
+| **1e7** | **0.8–0.9 / 1.0–1.2 m** | 0.5–0.6 m | **0.847 MB** | **0.9991** |
+
+1e6 and 2e6 fail the ~5 m bar at the southern edge. 5e6 is the real alternative
+and 1e7 buys one thing for its extra 0.089 MB: **bbox headroom**. q is
+bbox-relative and geo week bboxes are 95–110° wide (48 weeks sampled at stride
+29, plus the three built: max 110.5°, westernmost vertex 176.2 W, none crossing
+the dateline). One drought polygon west of the line would make a week's bbox
+~358° and triple its pitch — 7.6 m at 5e6, which fails; 3.8 m at 1e7, which
+holds. Dummy cannot have that problem: its Aleutians are folded into a fixed
+10-degree inset.

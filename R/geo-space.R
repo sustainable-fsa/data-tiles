@@ -70,25 +70,56 @@ GEO_FRAME <- c(xmin = -125.0, ymin = 24.0, xmax = -66.5, ymax = 49.6)
 ## wrapped_bboxes() is for; this gate only asks whether the numbers are degrees.
 GEO_ENVELOPE <- c(xmin = -180, ymin = -15.5, xmax = 180, ymax = 72.6)
 
-## ── Calibration constants — HYPOTHESES, not measurements ─────────────────────
-## Both of these are stated from arithmetic and are confirmed or replaced by a
-## measurement step (WP5) before any batch build. Nothing else in this repo is
-## allowed to carry a number nobody measured; these two are marked so they get
-## revisited rather than inherited.
+## ── Calibration constants — MEASURED 2026-09-01 ──────────────────────────────
+## Both arrived here as arithmetic and both have now been built and decoded
+## back: the two county tilesets at maxzoom 12 and 13, three USDM weeks at q =
+## 1e6, 2e6, 5e6 and 1e7. Neither value moved. CLAUDE.md carries the tables; the
+## reasons they decided what they did are here.
 ##
 ## GEO_MAXZOOM: the bar is ground resolution, not zoom number. Dummy z15 at
 ## --full-detail=13 quantises to 0.720 m of CONUS ground. Web Mercator at z13,
 ## same detail, is 0.597 m at the equator — the worst case anywhere this archive
 ## reaches (Guam 0.581, Puerto Rico 0.568, Alaska 0.30). z12 is 1.16 m at Guam,
 ## which fails a 1 m bar, so 13 is the first zoom that clears it.
+##
+## THE MEASUREMENT CONFIRMED THE ARITHMETIC AND ALMOST ARGUED AGAINST IT.
+## Decoding the maxzoom tiles over Guam, American Samoa, a Puerto Rico
+## municipio, Pinellas FL and an Alaska borough, and taking point-to-segment
+## distances against the build's own geojsonl in the local UTM zone, the worst
+## vertex sits 0.42 m from the source at z13 and 0.82 m at z12 — 0.71 of the
+## per-axis quantum in both cases, which is half a grid diagonal and is exactly
+## what rounding to a grid does. So EMPIRICAL deviation clears 1 m at both zooms
+## and only the per-axis quantum tells them apart. That is the number the bar was
+## written against; reading the diagonal instead would sell a 1.16 m grid as a
+## sub-metre one. z13 costs 83.2 MB against the dummy sibling's 61.7 (1.35x,
+## inside the 1.5x bar) where z12 would cost 51.6 — and 38% is the price of not
+## being coarser in the honest space than in the deliberate lie.
 GEO_MAXZOOM <- 13L
 
 ## GEO_QUANTIZATION: mapshaper's -o quantization is BBOX-RELATIVE. usdm.R's
 ## measured table settled on q=1e6 for a dummy week, whose bbox is 10 degrees
-## wide — a 4.6 x 3.1 m grid. A geo week's bbox is ~115 degrees wide, where the
-## same q is a ~13 m grid, which is simplification wearing an encoding's clothes
-## and is exactly what that table rejected 1e5 and 1e4 for. 1e7 restores the
-## pitch.
+## wide — a 4.6 x 3.1 m grid. A geo week's bbox is 95-110 degrees wide, where the
+## same q is 8-9 m at mid-latitude and 10-12 m at the southern edge, which is
+## simplification wearing an encoding's clothes and is exactly what that table
+## rejected 1e5 and 1e4 for. 1e7 restores the pitch: 0.81-0.90 m at mid-latitude,
+## 1.2 m at Puerto Rico, 0.48-0.59 m in y.
+##
+## THE PITCH DECIDES AND IT IS READ AT THE SOUTHERN EDGE of each week's own bbox,
+## where a degree of longitude is longest. Measured across four values on
+## 2013-03-05, 2019-08-27 and 2025-09-16 (the worst week in the archive): 1e6
+## lands at 10.0-11.7 m and 2e6 at 5.0-5.9 m, both past the ~5 m bar; 5e6 at
+## 2.0-2.3 m clears it and 1e7 at 1.0-1.2 m clears it four times over.
+## Round-trip retention rises
+## 0.9925 / 0.9974 / 0.9989 / 0.9991 on the worst week and gzip with it: 0.570 /
+## 0.644 / 0.758 / 0.847 MB.
+##
+## 5e6 IS THE REAL ALTERNATIVE and 1e7 beats it on one thing — bbox headroom.
+## q is bbox-relative, and this space, unlike dummy where the Aleutians are
+## folded into a fixed 10-degree inset, would present a 358-degree bbox for a
+## single drought polygon west of the dateline. That triples the pitch: 5e6 would
+## land at 7.6 m and fail the bar, 1e7 at 3.8 m and hold it. No such week exists
+## in 51 sampled across the archive — the USDM's own coverage stops at 176.2 W —
+## so this is insurance, and it costs 0.089 MB gzipped on the worst week.
 GEO_QUANTIZATION <- "1e7"
 
 ## ── Equal-area measure ───────────────────────────────────────────────────────
