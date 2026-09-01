@@ -45,6 +45,14 @@ ARTIFACTS <- list(
   list(pattern = "-outline-dummy\\.geojson$",
        content_type = "application/geo+json",
        cache_control = CACHE_TILES),
+  ## The geo family's outline, <tileset>-geo-outline.geojson. A separate class
+  ## rather than a widened one: the two patterns are disjoint — this requires
+  ## "-outline" immediately before the extension and the one above requires
+  ## "-dummy" there — so a dummy name cannot fall through to here whatever the
+  ## order, and the day the dummy outline is renamed the rename is visible.
+  list(pattern = "-outline\\.geojson$",
+       content_type = "application/geo+json",
+       cache_control = CACHE_TILES),
   ## application/json, not application/topojson or application/geo+json: it is
   ## what the boundary archives settled on, and it is what CloudFront will
   ## compress — worth 3x over the wire on exactly the payload the app scrubs
