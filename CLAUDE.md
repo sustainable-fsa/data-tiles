@@ -536,19 +536,21 @@ that question that cannot be wrong about it.
    `s3_write_manifest()` + `cf_invalidate()`. None of them did, so the first
    publish went up unlisted and `_manifest.txt` had to be written by hand. The
    invalidation uses `/<prefix>/tiles/*`, which counts as a single path.
-2. **Nothing in `sfsa-geographic/1` is published.** The bucket holds 63 dummy
-   objects and zero geo ones. The backfill is a manual sequence, in this order
-   so the cheap ones prove the machinery before the long one starts:
+2. **The geo family was backfilled 2026-09-01**, in the order that let the
+   cheap runs prove the machinery before the long one started:
    `SPACE=geo Rscript counties.R` (6 files) → `fsa-lfp-counties.R` (3) →
-   `census.R` (54, where the incremental skip proves itself) →
-   `SPACE=geo WORKERS=6 Rscript usdm.R` (1,390 weeks and an index; hours, and
-   splittable with `DATES`). Existing wildcard invalidations cover suffixed
-   names.
-3. **The workflow's `SPACES` is still `dummy`,** deliberately: until the
-   backfill above is in the bucket, the first scheduled `SPACE=geo` run would
-   try to build the whole USDM archive inside a 350-minute timeout. The flip to
-   `dummy geo` is a one-line commit and nothing else, and afterwards a quiet
-   Thursday costs four list calls instead of two.
+   `census.R` (54, where the incremental skip proved itself) →
+   `SPACE=geo WORKERS=6 Rscript usdm.R` (1,391 weeks and an index; ~40 min on
+   6 daemons). Verified over the CDN the same day: correct content types
+   including the new `-geo-outline.geojson` class, HTTP 206 on a ranged GET,
+   no `Content-Encoding` on PMTiles, `SPACE=geo SAMPLE=20 check-usdm.R` in
+   remote mode, and the dummy `usdm-index.json` untouched by any of it (its
+   only delta that day was `2026-08-25`, added by the cron itself). The
+   existing wildcard invalidations covered the suffixed names.
+3. **The workflow's `SPACES` flipped to `dummy geo`** in its own commit once
+   the backfill was in the bucket — earlier, the first scheduled `SPACE=geo`
+   run would have tried to build the whole USDM archive inside a 350-minute
+   timeout. A quiet Thursday now costs four list calls instead of two.
 4. **`counties.R` still inlines a bare `st_union()` for its dummy outline** where
    `census.R` and `fsa-lfp-counties.R` call `dissolve_outline()`. dd17/dd22
    happen to carry no pinholes, so the two agree by luck rather than by

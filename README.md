@@ -59,7 +59,7 @@ Two consequences worth knowing before consuming these tiles:
 Every artifact has a `-geo` sibling in `sfsa-geographic/1`: **true EPSG:4326, at
 real positions**, which renders on a stock MapLibre style, on `globe`, in QGIS,
 or anywhere else that reads GeoJSON. Same directories, same sidecar schema,
-`-geo` in the name. (The backfill is pending — see **Published artifacts**.)
+`-geo` in the name.
 
 ```
 tiles/<tileset>-geo.pmtiles
@@ -176,9 +176,8 @@ usdm/USDM_<date>.topojson              1,390 weeks, 2000-01-04 onward
 usdm/usdm-index.json
 ```
 
-Each of those has a `-geo` sibling in `sfsa-geographic/1`. **Those are not on the
-CDN yet** — the backfill is pending — so read `_manifest.txt` rather than
-assuming a name exists.
+Each of those has a `-geo` sibling in `sfsa-geographic/1`, published 2026-09-01.
+`_manifest.txt` lists both families.
 
 The USDM is **TopoJSON, not tiles**, and that is a measured choice: a week is
 five features and 100-266 K vertices of ~1:2,000,000 data, so there is nothing

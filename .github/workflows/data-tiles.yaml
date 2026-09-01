@@ -18,11 +18,11 @@
 #
 # TWO FAMILIES, ONE NESTED LOOP. Every script takes SPACE=dummy|geo and builds
 # exactly one space per invocation, so the update step iterates SCRIPTS x SPACES.
-# SPACES lands as `dummy`: the geographic family's 1,390 USDM weeks have to be
-# backfilled by hand first, or the Thursday after this file merged would try to
-# build the lot inside a 350-minute timeout. It flips to `dummy geo` in its own
-# commit once the backfill is published, after which a quiet Thursday costs four
-# list calls instead of two.
+# SPACES defaults to `dummy geo`: both families are published and discover
+# their own work, so a quiet Thursday costs four list calls instead of two.
+# It landed as `dummy` alone until the geographic family's 1,391 USDM weeks
+# were backfilled by hand (2026-09-01) — building the lot on a runner would
+# not have fit the 350-minute timeout.
 name: update
 run-name: Update the data-tiles archive → S3
 
@@ -46,7 +46,7 @@ on:
           sfsa-albers-usa/1 family, "geo" its true-EPSG:4326 sibling; every
           script named above runs once per space.
         type: string
-        default: dummy
+        default: dummy geo
   schedule:
     # Thursdays, 21:00 UTC — behind the whole USDM cascade. usdm publishes at
     # 13:00 (14:45 in winter) and usdm-counties at 20:20, so by 21:00 the week
@@ -143,7 +143,7 @@ jobs:
       CLOUDFRONT_DISTRIBUTION_ID: E1BNL6ONVN84RI
       CLOUDFRONT_BASE: https://data.sustainable-fsa.com
       SCRIPTS: ${{ inputs.scripts || 'usdm.R census.R' }}
-      SPACES: ${{ inputs.spaces || 'dummy' }}
+      SPACES: ${{ inputs.spaces || 'dummy geo' }}
     steps:
       - uses: mt-climate-office/actions/setup-geospatial@v1
 
