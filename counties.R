@@ -3,7 +3,9 @@
 ## sustainable-fsa/data-tiles · counties.R
 ##
 ## Build the FSA county composite as vector tiles, one PMTiles per boundary
-## vintage, in the sfsa-albers-usa/1 dummy space.
+## vintage, in either output space — sfsa-albers-usa/1, the dummy composite the
+## LFP Explorer renders, or sfsa-geographic/1, true EPSG:4326 for any standard
+## map. SPACE picks; see the configuration block.
 ##
 ## This is the same composite the boundary archives publish as TopoJSON, with
 ## one deliberate difference: NO ms_simplify(). The archives simplify at
@@ -19,8 +21,9 @@
 ## Puerto Rico, the residual being the archives' own simplification amplified by
 ## Puerto Rico's 2.5x inset scale.
 ##
-##   Rscript counties.R                  # both vintages, publish
+##   Rscript counties.R                           # both vintages, publish
 ##   VINTAGES=dd22 PUBLISH=0 Rscript counties.R   # one vintage, local only
+##   SPACE=geo PUBLISH=0 Rscript counties.R       # the geographic family
 ## =============================================================================
 
 suppressPackageStartupMessages({
@@ -28,6 +31,8 @@ suppressPackageStartupMessages({
   library(rmapshaper); library(jsonlite)
 })
 source("R/dummy-space.R")
+source("R/geo-space.R")
+source("R/outline.R")
 source("R/s3-archive.R")
 source("R/publish.R")
 sf::sf_use_s2(FALSE)
@@ -54,7 +59,70 @@ DROP_STATES <- c("60", "78", "14", "52", "69", "66")
 ## The clip mask year is PINNED. The archives leave tigris::counties() without a
 ## year=, so their coastline floats with the tigris release — in archives whose
 ## whole point is a frozen vintage. Ours does not float.
+##
+## THE CLIP IS NOT PER SPACE. Both families are cut at the same cb 500k 2024
+## waterline, because the reason for it is the source and not the projection:
+## the FSA composite's own extent reaches into open water. The mask carries all
+## thirteen territory counties, so it is not what decides whether they survive.
 MASK_YEAR <- 2024L
+
+## ── The output space ─────────────────────────────────────────────────────────
+## SPACE picks which family this invocation builds, and one invocation builds
+## exactly one. The two share the source, the clip, the flag block and the
+## sidecar schema and nothing else: sfsa-albers-usa/1 is a frozen inset
+## composite in a 10-degree dummy box, sfsa-geographic/1 is st_transform(4326).
+## Every artifact name goes through space_suffix(), which is what keeps the two
+## families from colliding on a filename. An unrecognised value stops there
+## rather than falling through to dummy, which would rebuild the published
+## family under a geo run's flags.
+SPACE  <- Sys.getenv("SPACE", unset = "dummy")
+SUFFIX <- space_suffix(SPACE)
+
+## The values that differ between the two, stated here rather than at each use
+## so the writers, the sidecar and the tippecanoe block stay single copies.
+##
+## COORDINATE_PRECISION is explicit because GDAL's GeoJSON driver defaults to 7
+## and neither space should inherit a default. 9 dp of DUMMY degrees is 0.5 mm
+## (the driver's own 7 would be 5 cm — fine here, but by luck); 7 dp of real
+## degrees is 1.1 cm, finer than the source and two digits per ordinate cheaper
+## across a ~190 MB intermediate. RFC7946=NO in both: dummy degrees are not
+## lng/lat and must not be normalised as such, and the geo family's
+## antimeridian wrap is settled in to_geo() — RFC 7946 mode would re-split it
+## on the way out.
+WRITER_OPTS <- c("COORDINATE_PRECISION=9", "RFC7946=NO")
+DESCRIPTION <- sprintf("%s - AlbersUSA composite in a 10-degree dummy box. NOT a geographic CRS. See js/projection.js in lfp-explorer.", SFSA_SPACE)
+CLIP        <- "--clip-bounding-box=-5.02,-3.06,5.02,3.06"
+
+if (SPACE == "geo") {
+  ## Ground resolution, not zoom number: Web Mercator at z13 with
+  ## --full-detail=13 quantises to 0.597 m at the equator, the worst case
+  ## anywhere this archive reaches, against dummy z15's 0.720 m of CONUS
+  ## ground. R/geo-space.R marks GEO_MAXZOOM a hypothesis until the calibration
+  ## run measures it, so it is read from there rather than restated here — a
+  ## number that may move must not have two homes.
+  MAXZOOM <- GEO_MAXZOOM
+
+  ## THE GEO FAMILY DROPS NOTHING, and the six FIPS above are not evidence that
+  ## it should. Dummy-Albers has nowhere to put Guam or American Samoa; true
+  ## EPSG:4326 has exactly where. Note that two of those codes never matched
+  ## anything even in the dummy build: this composite's territory rows carry
+  ## real FIPSST 60/66/69/78, but their ids are LEGACY — Guam 14001, the USVI
+  ## 52001/52003/52005, the Marianas 69085/69100/69110/69120, and five American
+  ## Samoa rows sharing 60001 that the dissolve by id makes one feature. The
+  ## filter reads stfips, where "14" and "52" are dead entries. The ids are what
+  ## the sidecar publishes, so they are what a coverage gate has to expect.
+  DROP_STATES <- character(0)
+
+  WRITER_OPTS <- c("COORDINATE_PRECISION=7", "RFC7946=NO")
+  DESCRIPTION <- sprintf("%s - true-position EPSG:4326, antimeridian-wrapped. Renders on standard maps including globe.", GEO_SPACE)
+
+  ## No clip box. The dummy one is belt and braces against a mis-shift, framed
+  ## on a layout this space does not have; the guard here is
+  ## assert_geo_envelope() inside to_geo(), which stops the build rather than
+  ## quietly cutting geometry off the edge of a box. A geo box would have to be
+  ## the whole world anyway, because Guam and American Samoa are in.
+  CLIP <- character(0)
+}
 
 s3_bucket <- Sys.getenv("S3_BUCKET", unset = "sustainable-fsa")
 s3_prefix <- Sys.getenv("S3_PREFIX", unset = "data-tiles")
@@ -117,38 +185,49 @@ build_vintage <- function(v) {
   stopifnot(!anyDuplicated(x$id))
   message("  counties: ", nrow(x))
 
-  ## AlbersUSA layout, then into the dummy space. Classified by state FIPS, which
-  ## is deterministic — see albers_usa_shift()'s note on why geometric
-  ## classification needs exploded POLYGONs.
-  x <- albers_usa_shift(x, state_fips = x$stfips) |> sf::st_make_valid()
-  x <- to_dummy(as_5070(x))
-  assert_dummy_bounds(x)
-  ## Label the dummy degrees EPSG:4326 for the writers. They are not lng/lat and
-  ## the space is not geographic — but every downstream consumer treats them as
-  ## if they were: GDAL's GeoJSON driver refuses to write a layer it cannot
-  ## relate to WGS84, tippecanoe reads lng/lat, and MapLibre renders them through
-  ## Mercator. The lie stops at this boundary; nothing reprojects them.
-  sf::st_crs(x) <- 4326
-  bb <- sf::st_bbox(x)
-  message(sprintf("  dummy bbox: %.6f %.6f %.6f %.6f", bb$xmin, bb$ymin, bb$xmax, bb$ymax))
+  ## ── Into the output space ─────────────────────────────────────────────────
+  if (SPACE == "geo") {
+    ## One call, and deliberately not the dummy pipeline with a flag: there is
+    ## no inset layout to classify into, no shear, nothing to relabel
+    ## afterwards. The source is already true-position EPSG:4326, so to_geo()
+    ## reduces to the antimeridian wrap, the equal-area assert across it and the
+    ## envelope gate. It returns MULTIPOLYGON throughout — do not add a cast or
+    ## an st_make_valid() here, both already ran in there.
+    x <- to_geo(x)
+    bb <- sf::st_bbox(x)
+    message(sprintf("  geo bbox: %.6f %.6f %.6f %.6f", bb$xmin, bb$ymin, bb$xmax, bb$ymax))
+  } else {
+    ## AlbersUSA layout, then into the dummy space. Classified by state FIPS, which
+    ## is deterministic — see albers_usa_shift()'s note on why geometric
+    ## classification needs exploded POLYGONs.
+    x <- albers_usa_shift(x, state_fips = x$stfips) |> sf::st_make_valid()
+    x <- to_dummy(as_5070(x))
+    assert_dummy_bounds(x)
+    ## Label the dummy degrees EPSG:4326 for the writers. They are not lng/lat and
+    ## the space is not geographic — but every downstream consumer treats them as
+    ## if they were: GDAL's GeoJSON driver refuses to write a layer it cannot
+    ## relate to WGS84, tippecanoe reads lng/lat, and MapLibre renders them through
+    ## Mercator. The lie stops at this boundary; nothing reprojects them.
+    sf::st_crs(x) <- 4326
+    bb <- sf::st_bbox(x)
+    message(sprintf("  dummy bbox: %.6f %.6f %.6f %.6f", bb$xmin, bb$ymin, bb$xmax, bb$ymax))
+  }
 
   ## ── Layer 1: the counties ─────────────────────────────────────────────────
-  ## COORDINATE_PRECISION=9 is explicit: GDAL's GeoJSON writer defaults to 7,
-  ## which happens to be fine here (1e-7 dummy degrees is 5 cm) but only by
-  ## luck. RFC7946=NO because these are not real lng/lat and must not be
-  ## normalised as such.
-  f_counties <- file.path("build", sprintf("%s-counties.geojsonl", v))
+  ## WRITER_OPTS is per space; the configuration block carries why the precision
+  ## is stated rather than inherited from the driver.
+  f_counties <- file.path("build", sprintf("%s%s-counties.geojsonl", v, SUFFIX))
   x |>
     dplyr::select(id, state, county) |>
     sf::st_write(f_counties, driver = "GeoJSONSeq", delete_dsn = TRUE, quiet = TRUE,
-                 layer_options = c("COORDINATE_PRECISION=9", "RFC7946=NO"))
+                 layer_options = WRITER_OPTS)
 
   ## ── Layer 2: the state mesh ───────────────────────────────────────────────
   ## The kit currently derives this client-side with topojson.mesh(), which has
   ## no MVT equivalent — there is no mesh operation in a tile. So precompute the
   ## interior lines. ms_innerlines() on 50-odd dissolved states is cheap even at
   ## full resolution.
-  f_states <- file.path("build", sprintf("%s-states.geojsonl", v))
+  f_states <- file.path("build", sprintf("%s%s-states.geojsonl", v, SUFFIX))
   states <- x |>
     dplyr::mutate(st = substr(id, 1, 2)) |>
     dplyr::group_by(st) |>
@@ -156,46 +235,105 @@ build_vintage <- function(v) {
     sf::st_make_valid()
   rmapshaper::ms_innerlines(states) |>
     sf::st_write(f_states, driver = "GeoJSONSeq", delete_dsn = TRUE, quiet = TRUE,
-                 layer_options = c("COORDINATE_PRECISION=9", "RFC7946=NO"))
+                 layer_options = WRITER_OPTS)
 
   ## ── The national outline ──────────────────────────────────────────────────
   ## Published because the USDM pipeline clips against it: the NDMC's own
   ## coastline is ~1:2,000,000 and would spill past the counties otherwise.
-  f_outline <- file.path("tiles", sprintf("fsa-counties-%s-outline-dummy.geojson", v))
-  sf::st_union(x) |>
-    sf::st_sf(geometry = _) |>
-    sf::st_write(f_outline, driver = "GeoJSON", delete_dsn = TRUE, quiet = TRUE,
-                 layer_options = c("COORDINATE_PRECISION=9", "RFC7946=NO"))
+  ##
+  ## The two paths differ by more than a filename, and the dummy one is the odd
+  ## one out: a bare st_union() with no pinhole guard, which agrees with
+  ## dissolve_outline() only because dd17/dd22 happen to carry no pinholes. That
+  ## is luck, not construction — the open thread says adopt the helper the next
+  ## time these are rebuilt, and rebuilding them is a 1.4 GB republish, so it
+  ## stays deferred. The geo path is new and starts on the helper, with the
+  ## square-metre measure its space needs: the default reads planar deg2 and
+  ## scales by DUMMY$deg_m, which on real degrees would call a ring at 60 N the
+  ## same size as one at the equator.
+  if (SPACE == "geo") {
+    f_outline <- file.path("tiles", sprintf("fsa-counties-%s-geo-outline.geojson", v))
+    write_outline(dissolve_outline(x, ring_m2 = geo_ring_m2), f_outline)
+  } else {
+    f_outline <- file.path("tiles", sprintf("fsa-counties-%s-outline-dummy.geojson", v))
+    sf::st_union(x) |>
+      sf::st_sf(geometry = _) |>
+      sf::st_write(f_outline, driver = "GeoJSON", delete_dsn = TRUE, quiet = TRUE,
+                   layer_options = c("COORDINATE_PRECISION=9", "RFC7946=NO"))
+  }
 
   ## ── The index sidecar ─────────────────────────────────────────────────────
   ## Vector tiles cannot supply counties.index, counties.names or
   ## countyCentroid(): queryRenderedFeatures returns only what is rendered,
   ## clipped and simplified for the zoom. The bbox midpoint here is exactly what
   ## the kit's countyCentroid() computes today, so behaviour is preserved.
-  bxs <- do.call(rbind, lapply(sf::st_geometry(x), function(gi) as.numeric(sf::st_bbox(gi))))
-  idx <- list(
-    schema  = jsonlite::unbox("sfsa-county-index/1"),
-    space   = jsonlite::unbox(SFSA_SPACE),
-    vintage = jsonlite::unbox(v),
-    n       = jsonlite::unbox(nrow(x)),
-    bounds  = as.numeric(DUMMY$bounds[c("xmin", "ymin", "xmax", "ymax")]),
-    tiles   = list(
-      url      = jsonlite::unbox(sprintf("fsa-counties-%s.pmtiles", v)),
-      minzoom  = jsonlite::unbox(0L),
-      maxzoom  = jsonlite::unbox(MAXZOOM),
-      extent   = jsonlite::unbox(8192L),
-      layers   = list(counties = jsonlite::unbox("counties"),
-                      states   = jsonlite::unbox("states"))
-    ),
-    counties     = x$id,
-    county_names = x$county,
-    state_names  = x$state,
-    ## Index-aligned bbox columns, 6 dp (0.54 m). Parallel arrays rather than
-    ## objects, matching the house payload convention.
-    x0 = round(bxs[, 1], 6), y0 = round(bxs[, 2], 6),
-    x1 = round(bxs[, 3], 6), y1 = round(bxs[, 4], 6)
-  )
-  f_index <- file.path("tiles", sprintf("fsa-counties-%s-index.json", v))
+  if (SPACE == "geo") {
+    ## WRAPPED bboxes, and the difference is not cosmetic. Aleutians West has
+    ## parts on both sides of the antimeridian, so its plain st_bbox() is
+    ## [-179.15, 179.78] — arithmetically right, and 359 degrees wide instead of
+    ## 21, which every fitBounds() reads as the whole Pacific. wrapped_bboxes()
+    ## counts the east-hemisphere parts at lon - 360 instead, so an x0 below
+    ## -180 is this space's convention rather than a bug. R/geo-space.R's header
+    ## is the full account.
+    bxs <- wrapped_bboxes(x)
+    idx <- list(
+      schema  = jsonlite::unbox("sfsa-county-index/1"),
+      space   = jsonlite::unbox(GEO_SPACE),
+      ## Additive, and not a restatement of `space`: the space token names a
+      ## versioned contract — this CRS plus the wrapped-bbox convention plus the
+      ## frame below — and an app that read only the CRS would get the Aleutians
+      ## wrong.
+      crs     = jsonlite::unbox("EPSG:4326"),
+      vintage = jsonlite::unbox(v),
+      n       = jsonlite::unbox(nrow(x)),
+      ## MEASURED, and from the same wrapped measure the x0/x1 columns publish,
+      ## so it contains every county box by construction. st_bbox() of the whole
+      ## set would be the full [-180, 180] and say nothing. It is near-world
+      ## once Guam and American Samoa are in — which in this space they are — so
+      ## it is the extent and not the camera: frame_bounds is the camera, frozen
+      ## so a ?lng/?lat/?zoom means the same thing every session.
+      bounds  = round(c(min(bxs$x0), min(bxs$y0), max(bxs$x1), max(bxs$y1)), 6),
+      frame_bounds = as.numeric(GEO_FRAME[c("xmin", "ymin", "xmax", "ymax")]),
+      tiles   = list(
+        url      = jsonlite::unbox(sprintf("fsa-counties-%s%s.pmtiles", v, SUFFIX)),
+        minzoom  = jsonlite::unbox(0L),
+        maxzoom  = jsonlite::unbox(MAXZOOM),
+        extent   = jsonlite::unbox(8192L),
+        layers   = list(counties = jsonlite::unbox("counties"),
+                        states   = jsonlite::unbox("states"))
+      ),
+      counties     = x$id,
+      county_names = x$county,
+      state_names  = x$state,
+      ## Index-aligned bbox columns, 6 dp — 11 cm of real degrees.
+      x0 = round(bxs$x0, 6), y0 = round(bxs$y0, 6),
+      x1 = round(bxs$x1, 6), y1 = round(bxs$y1, 6)
+    )
+  } else {
+    bxs <- do.call(rbind, lapply(sf::st_geometry(x), function(gi) as.numeric(sf::st_bbox(gi))))
+    idx <- list(
+      schema  = jsonlite::unbox("sfsa-county-index/1"),
+      space   = jsonlite::unbox(SFSA_SPACE),
+      vintage = jsonlite::unbox(v),
+      n       = jsonlite::unbox(nrow(x)),
+      bounds  = as.numeric(DUMMY$bounds[c("xmin", "ymin", "xmax", "ymax")]),
+      tiles   = list(
+        url      = jsonlite::unbox(sprintf("fsa-counties-%s.pmtiles", v)),
+        minzoom  = jsonlite::unbox(0L),
+        maxzoom  = jsonlite::unbox(MAXZOOM),
+        extent   = jsonlite::unbox(8192L),
+        layers   = list(counties = jsonlite::unbox("counties"),
+                        states   = jsonlite::unbox("states"))
+      ),
+      counties     = x$id,
+      county_names = x$county,
+      state_names  = x$state,
+      ## Index-aligned bbox columns, 6 dp (0.54 m). Parallel arrays rather than
+      ## objects, matching the house payload convention.
+      x0 = round(bxs[, 1], 6), y0 = round(bxs[, 2], 6),
+      x1 = round(bxs[, 3], 6), y1 = round(bxs[, 4], 6)
+    )
+  }
+  f_index <- file.path("tiles", sprintf("fsa-counties-%s%s-index.json", v, SUFFIX))
   jsonlite::write_json(idx, f_index, auto_unbox = FALSE, digits = NA)
   message("  index: ", nrow(x), " counties, ",
           round(file.size(f_index) / 1024), " KB")
@@ -208,15 +346,18 @@ build_vintage <- function(v) {
   ##   --no-simplification-of-shared-nodes  or adjacent counties crack apart at low zoom
   ##   --no-tiny-polygon-reduction  or sub-pixel islands become area-equivalent squares
   ##   --no-tile-size-limit/--no-feature-limit  a dropped county is a silent hole
-  ##   --clip-bounding-box          belt and braces against a mis-shift
-  ## NEVER --use-attribute-for-id / -ai / -aI: MVT feature ids are uint64, so
-  ## "01001" would become 1001. The id stays a STRING PROPERTY; promoteId lifts
-  ## it and filters read ['get','id'].
-  f_pmtiles <- file.path("tiles", sprintf("fsa-counties-%s.pmtiles", v))
+  ##   --clip-bounding-box          belt and braces against a mis-shift; DUMMY
+  ##                                ONLY, CLIP being empty in geo
+  ## ONE BLOCK FOR BOTH SPACES, not a copy each: only the maxzoom, the
+  ## description and the clip box differ, and those come from the configuration
+  ## block. NEVER --use-attribute-for-id / -ai / -aI: MVT feature ids are
+  ## uint64, so "01001" would become 1001. The id stays a STRING PROPERTY;
+  ## promoteId lifts it and filters read ['get','id'].
+  f_pmtiles <- file.path("tiles", sprintf("fsa-counties-%s%s.pmtiles", v, SUFFIX))
   args <- c(
     sprintf("--output=%s", f_pmtiles), "--force",
-    sprintf("--name=FSA counties %s", v),
-    sprintf("--description=%s - AlbersUSA composite in a 10-degree dummy box. NOT a geographic CRS. See js/projection.js in lfp-explorer.", SFSA_SPACE),
+    sprintf("--name=FSA counties %s%s", v, SUFFIX),
+    sprintf("--description=%s", DESCRIPTION),
     "--attribution=USDA Farm Service Agency; Sustainable FSA archive",
     sprintf("--named-layer=counties:%s", f_counties),
     sprintf("--named-layer=states:%s", f_states),
@@ -226,7 +367,7 @@ build_vintage <- function(v) {
     "--simplify-only-low-zooms", "--no-simplification-of-shared-nodes",
     "--no-tiny-polygon-reduction", "--no-tile-size-limit", "--no-feature-limit",
     "--include=id", "--include=state", "--include=county",
-    "--clip-bounding-box=-5.02,-3.06,5.02,3.06",
+    CLIP,
     "--no-tile-stats", "--read-parallel"
   )
   message("  tippecanoe -> ", f_pmtiles)
