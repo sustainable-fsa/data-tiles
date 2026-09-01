@@ -1,10 +1,16 @@
 ## =============================================================================
 ## sustainable-fsa/data-tiles · R/outline.R
 ##
-## The national outline, dissolved from a county set already in dummy degrees.
+## The national outline, dissolved from a county set already in its output
+## space — dummy degrees, or true EPSG:4326 for the geo family.
 ##
 ## Published because the USDM pipeline clips against it: the NDMC's own
 ## coastline is ~1:2,000,000 and would spill past the counties otherwise.
+##
+## THE SPACE ENTERS ONLY THROUGH `ring_m2`. The dissolve and the guard are pure
+## topology and do not care what the coordinates mean; the pinhole threshold is
+## in square metres and does, so the measure is the caller's to supply and the
+## default is the dummy one.
 ##
 ## AN ENCLOSED RING IN A DISSOLVED COUNTY SET IS ALMOST NEVER WATER. Where a
 ## boundary file is not edge-matched, unioning it leaves a pinhole everywhere
@@ -24,22 +30,30 @@
 ## than by construction.
 ## =============================================================================
 
+## Ring area in square metres for a geometry in DUMMY degrees, via a CRS-less
+## st_polygon, deliberately: x is LABELLED EPSG:4326 and st_area() would read
+## that label and return geodesic metres off dummy degrees, which are not
+## degrees. Planar deg2 scaled by deg_m is the only honest reading.
+##
+## The default measure, and the whole reason `ring_m2` is a parameter: the same
+## arithmetic applied to REAL degrees is wrong, because a pinhole's area then
+## depends on its latitude. Geo callers pass R/geo-space.R's geo_ring_m2().
+dummy_ring_m2 <- function(r) {
+  abs(as.numeric(sf::st_area(sf::st_polygon(list(r))))) * DUMMY$deg_m^2
+}
+
 ## Dissolve `x` to a single outline, dropping pinholes below `max_hole_m2`.
 ##
 ## @param x an sf in dummy degrees, LABELLED EPSG:4326 (see counties.R on why
-##   the label is a lie that stops at the writer boundary)
+##   the label is a lie that stops at the writer boundary) — or, for the geo
+##   family, in true EPSG:4326, in which case pass `ring_m2` too
 ## @param max_hole_m2 keep-and-announce threshold; rings above it survive
 ## @param quiet suppress the per-call message
+## @param ring_m2 how to measure one ring, in square metres; defaults to the
+##   dummy measure so dummy callers are unchanged
 ## @return an sfc of one MULTIPOLYGON, crs 4326
-dissolve_outline <- function(x, max_hole_m2 = 1e6, quiet = FALSE) {
-  ## Ring area via a CRS-less st_polygon, deliberately: x is LABELLED EPSG:4326
-  ## and st_area() would read that label and return geodesic metres off dummy
-  ## degrees, which are not degrees. Planar deg2 scaled by deg_m is the only
-  ## honest reading.
-  ring_m2 <- function(r) {
-    abs(as.numeric(sf::st_area(sf::st_polygon(list(r))))) * DUMMY$deg_m^2
-  }
-
+dissolve_outline <- function(x, max_hole_m2 = 1e6, quiet = FALSE,
+                             ring_m2 = dummy_ring_m2) {
   dropped <- 0L
   kept    <- numeric(0)
   parts <- lapply(sf::st_cast(sf::st_union(x), "MULTIPOLYGON")[[1]], function(pp) {
