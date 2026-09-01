@@ -1,10 +1,11 @@
 # data-tiles
 
-Vector tiles (PMTiles) for the Sustainable FSA maps. Everything here is
-projected into the dummy-Albers space the LFP Explorer renders in; that
-transform lives in exactly one place, `R/dummy-space.R`, because two
-implementations that drift misregister layers by up to 765 m with nothing on
-screen to show it.
+Vector tiles (PMTiles) for the Sustainable FSA maps, in **two coordinate
+spaces**. `sfsa-albers-usa/1` is the dummy-Albers space the LFP Explorer renders
+in; `sfsa-geographic/1` is true EPSG:4326, for any standard map including
+`globe`. Each transform lives in exactly one place — `R/dummy-space.R` and
+`R/geo-space.R` — because two implementations that drift misregister layers by
+up to 765 m with nothing on screen to show it.
 
 ```
 counties.R            FSA county tiles (dd17/dd22) + composite
@@ -12,14 +13,58 @@ census.R              vintage-matched Census county tiles, 18 vintages
 fsa-lfp-counties.R    the NDMC/FSA LFP determination boundaries
 usdm.R                the weekly USDM, 1,390 weeks of TopoJSON
 R/dummy-space.R       the AlbersUSA shift and dummy-space transform
+R/geo-space.R         the ONLY copy of the sfsa-geographic/1 transform
 R/outline.R           the dissolved national outline and its pinhole guard
 R/publish.R           the artifact classes and the ONLY copy of the cache policy
 R/s3-archive.R        vendored shared S3 helpers
-tools/                the four gates
+tools/                the gates, all of them space-aware or space-agnostic
 build/  tiles/        intermediates and PMTiles output
 ```
 
-`VINTAGES=2020 PUBLISH=0 Rscript census.R` narrows a run.
+`SPACE=geo VINTAGES=2020 PUBLISH=0 Rscript census.R` narrows a run. `SPACE`
+picks the family, default `dummy`, one per invocation — see **The geographic
+family** below.
+
+## The toolchain decides the bytes: sf must be built from source
+
+Every number in this file was measured against **sf built from source** —
+`pak::pak("sf?source")` — over Homebrew GDAL 3.13.3 / GEOS 3.14.1 / PROJ 9.8.1.
+**The CRAN macOS binary reproduces nothing here byte-identically.** It bundles
+GDAL 3.8.5 and PROJ 9.5.1 with no datum grids and no Parquet driver, and both
+absences are silent:
+
+- **No grids means no datum shift.** Every transform in this repo crosses NAD83
+  and WGS84 — `R/dummy-space.R:233` runs `st_transform("ESRI:102003")` on a
+  WGS84 source, `census.R` reads EPSG:4269 — and PROJ picks its operation *per
+  coordinate*. With the grids present it picks an `hgridshift`: (−96, 29.5)
+  moves 0.612 m through `us_noaa_ethpgn.tif`, Honolulu 1.57 m, San Juan 1.01 m,
+  and Anchorage, Guam and Pago Pago 0 m because there the best available
+  candidate genuinely is a null transform. Without them all of it becomes
+  `+proj=noop` — 4 m of declared accuracy sold as an answer — and there is no
+  error and no warning.
+- **No Parquet driver means `usdm.R` cannot read a week.** `usdm.R:215` goes
+  through `sf::read_sf()` on the source parquet. The three county scripts use
+  `arrow::read_parquet()` and would not notice.
+
+So the symptom of the wrong stack is not a failure. It is a byte-identity check
+that fails on every artifact with no line of code to blame, and geometry 0.6–2.3
+m from where the published family already sits.
+
+**CI is not the CRAN binary either, but it is not local-equivalent by
+construction.** `setup-geospatial@v1` builds one conda-forge env — `r-base`,
+`r-sf`, `gdal`, `geos`, `proj`, `libgdal-arrow-parquet`, all unpinned — so sf
+links conda-forge GDAL/GEOS/PROJ and the Parquet driver is there. But
+conda-forge ships `proj` **without** `proj-data`, and its activation script sets
+`PROJ_NETWORK=ON` in its place: the grids stream from `cdn.proj.org` per run and
+are *not* in the action's env cache. A CDN outage therefore degrades the whole
+build to `noop` and publishes it. The workflow's **Gate the R geospatial stack**
+step is the only thing standing between that and the bucket — GDAL floor,
+Parquet driver, and (−96, 29.5) asserted to move at all. Verified by pointing
+`PROJ_DATA` at a directory holding only `proj.db`: 0.0000 m, exit 1.
+
+One more version-shaped trap: **GDAL 3.13 writes compact GeoJSONSeq**, so any
+grep of a `build/*.geojsonl` intermediate needs `"id": ?"…"` rather than the
+padded form older drivers emitted.
 
 ## Three county authorities, and why they are not interchangeable
 
@@ -33,15 +78,17 @@ choropleth has to be drawn on the polygons its numbers came from.
 | `census.R` | `census-counties-<year>` × 18 | `census-counties` `data/clipped/` | **upstream**, each vintage's own cb |
 | `fsa-lfp-counties.R` | `fsa-lfp-counties` | `fsa-lfp-counties` (FOIA) | **not at all** — see below |
 
-All three now publish the same shape: a `counties` layer and a `states`
-innerlines layer inside the PMTiles, an `-index.json` sidecar and an
-`-outline-dummy.geojson`. Every one lands in `sfsa-albers-usa/1`, drops the same
-six territory FIPS, and carries `id` / `state` / `county` string properties.
+All three publish the same shape: a `counties` layer and a `states` innerlines
+layer inside the PMTiles, an `-index.json` sidecar and an outline GeoJSON. Every
+one lands in whichever space the run asked for and carries `id` / `state` /
+`county` string properties; in `sfsa-albers-usa/1` all three drop the same six
+territory FIPS, and in `sfsa-geographic/1` none of them drops anything.
 
 The census sidecars carry two fields the others do not: `vintage`, the boundary
 year as a string, and **`mask_year`, the coastline the geometry was actually cut
 at** — not always the vintage, and the app has no other way to know it. Both are
-additive to `sfsa-county-index/1`.
+additive to `sfsa-county-index/1`; so are the three fields a geo sidecar adds
+(`crs`, `frame_bounds`, and for census `mask_years`).
 
 ## census.R: repointed 2026-08-22, builds all 18 vintages
 
@@ -80,8 +127,9 @@ Four things that were load-bearing on the way, all of them now gates:
 4. **CRS is EPSG:4269**, so `st_transform(4326)` stays. The clipped form is
    MULTIPOLYGON throughout and valid under both s2 and GEOS, asserted upstream.
 
-The territory filter (`60, 78, 14, 52, 69, 66`) stays: the archive carries those
-counties and dummy-Albers only places CONUS, AK, HI and PR.
+The territory filter (`60, 78, 14, 52, 69, 66`) stays **in dummy**: the archive
+carries those counties and dummy-Albers only places CONUS, AK, HI and PR. It is
+empty in geo, where there is somewhere to put them.
 
 **The source is cached under `build/census/`.** A clipped vintage is ~46 MB and
 there are eighteen; without the cache a rebuild pulls 830 MB from the CDN every
@@ -165,8 +213,8 @@ wearing an encoding's clothes.
 
 Published **unclipped**: the app switches between four county authorities and a
 baked-in coastline would mismatch three of them. The overspill is masked
-client-side with the inverse of whichever `-outline-dummy.geojson` is active —
-**which is app work that does not exist yet.**
+client-side with the inverse of whichever outline GeoJSON is active —
+**which is app work that does not exist yet, now in both spaces.**
 
 ### The classifier bug it had to fix first
 
@@ -227,28 +275,250 @@ It stays invisible here because this repo runs `sf_use_s2(FALSE)` (line 40) and
 never asks s2 anything — but the spurious pieces and pinholes are real in planar
 geometry too.
 
+## The geographic family
+
+Everything this repo publishes, a second time, in true EPSG:4326:
+`sfsa-geographic/1`. The dummy family renders correctly in exactly one
+application — `lfp-explorer`, which owns the matching `js/projection.js` —
+because it is an AlbersUSA composite wearing a lng/lat label. This one renders
+in QGIS, on a stock MapLibre style, and on `globe`. **Purely additive**: the
+dummy family keeps building byte-identically, and that constraint shaped every
+decision below.
+
+`SPACE=dummy|geo` (default `dummy`), **one space per invocation**, with an
+explicit `if (SPACE == "geo") {…} else {existing code verbatim}` at each branch
+point. One space per run is not a limitation waiting to be fixed: it is what
+keeps the dummy hot path textually intact, which is what makes byte-identity
+provable at all, and it keeps the `Rscript` lazy-parse hazard down to one family
+per process.
+
+Every artifact name goes through `space_suffix()`, which returns `"-geo"` or
+`""` and **hard-errors on anything else** — a typo falling through to `""` would
+rebuild and republish the dummy family under a geo run's flags. That one
+function is also what makes the incremental skip per-space for free: the two
+families cannot collide on a filename, so a geo run listing the bucket sees only
+geo objects and a dummy run is unaffected by however much geo is on disk.
+
+| dummy | geo |
+|---|---|
+| `tiles/<t>.pmtiles` | `tiles/<t>-geo.pmtiles` |
+| `tiles/<t>-index.json` | `tiles/<t>-geo-index.json` |
+| `tiles/<t>-outline-dummy.geojson` | `tiles/<t>-geo-outline.geojson` |
+| `usdm/USDM_<date>.topojson` | `usdm/USDM_<date>-geo.topojson` |
+| `usdm/usdm-index.json` | `usdm/usdm-geo-index.json` |
+
+The outline is the one name that is not a single pattern: the dummy form was
+already published and could not move, so the space word sits after `outline`
+there and before it in geo. Everything else is `<name><SUFFIX><rest>`, and the
+manifest and invalidation wildcards already covered suffixed names.
+
+**A `space` value is a contract, not a CRS.** `sfsa-geographic/1` names
+EPSG:4326 *plus* the wrapped-bbox convention below *plus* the frame box, and the
+sidecar carries `crs: "EPSG:4326"` separately for anyone who only wants the
+projection. An app that read the CRS and assumed the bbox convention would get
+the Aleutians wrong.
+
+**`bounds` is honest and useless for framing; `frame_bounds` is the camera.** A
+geo sidecar's `bounds` is measured off the artifact's own geometry — which, with
+Guam at 144.6 E and American Samoa at 14.5 S in the same tileset, is nearly
+world-wide, and `fitBounds()` on it opens over the Pacific. So publish both: the
+additive `frame_bounds` is the frozen `GEO_FRAME = (−125.0, 24.0, −66.5, 49.6)`,
+a CONUS camera box, frozen for dummy-space's reason — the app's
+`?lng/?lat/?zoom` is expressed against it and has to mean the same thing every
+session. The geo USDM index carries `frame_bounds` and *no* `bounds`, because no
+week's extent is the frame and each week's own extent is in its TopoJSON bbox.
+
+**Never frame from the PMTiles header.** tippecanoe writes the plain, unwrapped
+bbox into the v3 header, so a tileset containing Aleutians West reports a header
+spanning nearly the whole Pacific. That is the number a library hands you by
+default and it is neither of the two useful ones — frame from the sidecar's
+`frame_bounds`, take extent from its `bounds`.
+
+**Wrapped per-county bboxes, and `x0` below −180 is the convention.** Measured on
+the 2020 clipped vintage, exactly one county straddles the antimeridian —
+Aleutians West, `02016` — and its 67 polygon parts each sit wholly on one side,
+14 east and 53 west, no ring crossing. So `st_wrap_dateline()` has nothing to
+split and is kept as a no-op detector. The hazard is arithmetic, not geometry:
+`02016`'s plain `st_bbox()` is [−179.15, 179.78], which is right and describes a
+box wrapped the wrong way round the planet, 359° wide instead of 21, and every
+consumer of the sidecar reads it as the whole Pacific. `wrapped_bboxes()` counts
+the east-hemisphere parts at `lon − 360`, so `x0` comes back at −187.54 and
+MapLibre takes it happily. The threshold is per vertex and is safe only because
+`to_geo()` ran first; the straddle test is on the plain bbox, so the expensive
+path runs for one feature in 3,234 and an ordinary CONUS county's row is
+`st_bbox()` exactly.
+
+**The geo family drops nothing, and the six dummy FIPS were never the whole
+story.** Dummy-Albers has nowhere to put Guam or American Samoa and true
+EPSG:4326 has exactly where. Two of the six codes never matched anything even in
+the dummy build: the FSA composite's territory rows carry real `FIPSST`
+60/66/69/78, but their **ids are legacy** — Guam `14001`, the USVI
+`52001/52003/52005`, the Marianas `69085/69100/69110/69120`, and five American
+Samoa rows sharing `60001` that the dissolve by id makes one feature. The filter
+reads `stfips`, where `"14"` and `"52"` are dead entries. The ids are what the
+sidecar publishes, so they are what a coverage gate has to expect: **dd22-geo is
+3,115 features** against dummy's 3,106, and a census vintage gains the territory
+counties the Census parquet carries under real 60/66/69/78 — 13 of them in the
+two measured, 2009-geo and 2020-geo, both 3,234 against 3,221.
+`fsa-lfp-counties-geo` stays 3,221 and a USDM week stays five features, because
+neither source carries a territory at all.
+
+**`mask_year` becomes a scalar plus an array.** In dummy the territory filter
+made `unique(mask_year)` single-valued and that was asserted. Geo keeps those 13
+counties, so on 2009 and 2011 a vintage genuinely carries two values and
+single-valued is no longer a fact. The rule that replaces the assert is the same
+statement in the only form still true: **every non-territory row shares one mask
+year**, that value stays the scalar the sidecar and the tileset description
+carry, and a second value is tolerated only on territory rows. Anything else is
+the upstream clip mask composition changing, which is what the assert exists
+for, and it stops the build in both spaces. The full set goes out as an additive
+`mask_years`; only 2009 and 2011 are `[2010, 2013]`.
+
+**Precision and flags.** Geo intermediates are written
+`COORDINATE_PRECISION=7` — 1.1 cm of real degrees, finer than any source here,
+where the dummy 9 dp was calibrated to dummy degrees and would be two wasted
+digits per ordinate across a ~190 MB file. `RFC7946=NO` in both spaces: dummy
+degrees are not lng/lat and must not be normalised as such, and RFC 7946 mode
+would re-split the antimeridian wrap `to_geo()` already settled. The tippecanoe
+block is **one block for both spaces** — only the maxzoom, the description and
+`--clip-bounding-box` differ, and the clip box is dummy-only, being belt and
+braces against a mis-shift in a layout this space does not have. The geo guard
+is `assert_geo_envelope()` inside `to_geo()`, which stops the build rather than
+quietly cutting geometry off the edge of a box; a geo box would have to be the
+whole world anyway.
+
+### The calibration, measured 2026-09-01
+
+Both constants in `R/geo-space.R` arrived as arithmetic and were built and
+decoded back. **Neither moved.** GDAL 3.13.3 / GEOS 3.14.1 / PROJ 9.8.1,
+mapshaper 0.6.113, every run `PUBLISH=0`.
+
+**`GEO_MAXZOOM = 13L`.** dd22-geo and census-counties-2020-geo built at both
+zooms; deviation is `tippecanoe-decode` of the maxzoom tiles over Guam, American
+Samoa, a PR municipio, Pinellas FL and an Alaska borough, point-to-segment
+against the build's own geojsonl in the local UTM zone, with the clip artefacts
+(tile border, tippecanoe's 5/256 buffer rect) excluded.
+
+| maxzoom | per-axis quantum | worst deviation | dd22-geo | census-2020-geo |
+|---|---|---|---|---|
+| 13 | 0.30–0.58 m | **0.42 m** (PR) | 83.2 MB (1.35× dummy) | 88.4 MB (1.36×) |
+| 12 | 0.61–1.16 m | 0.82 m (PR) | 51.6 MB (0.84×) | 54.2 MB (0.84×) |
+
+The measured deviation is 0.71 of the quantum at both zooms — half a grid
+diagonal, which is exactly what rounding to a grid does — so **empirical
+deviation clears 1 m at both zooms and only the per-axis quantum separates
+them**. That is the number the ≤1 m bar was written against; reading the
+diagonal instead would sell a 1.16 m grid as a sub-metre one. The 38% size
+premium is the price of not being coarser in the honest space than in the
+deliberate lie.
+
+**`GEO_QUANTIZATION = "1e7"`.** mapshaper's `-o quantization` is
+**bbox-relative**, and that is the whole reason the two spaces cannot share the
+number: `q=1e6` over a 10-degree dummy box is a 4.6 × 3.1 m grid and over a geo
+week's 95–110° box it is 8–12 m, which is simplification wearing an encoding's
+clothes and is exactly what usdm.R's own table rejected 1e5 for. Weeks
+2013-03-05, 2019-08-27 and 2025-09-16 (the archive's worst) at four values;
+pitch is per file from its own `transform.scale`, read at the bbox's southern
+edge where a degree of longitude is longest.
+
+| q | pitch x mid / south | pitch y | worst-week gz | worst retention |
+|---|---|---|---|---|
+| 1e6 | 8.1–9.0 / 10.0–11.7 m | 4.8–5.9 m | 0.570 MB | 0.9925 |
+| 2e6 | 4.0–4.5 / 5.0–5.9 m | 2.4–2.9 m | 0.644 MB | 0.9974 |
+| 5e6 | 1.6–1.8 / 2.0–2.3 m | 1.0–1.2 m | 0.758 MB | 0.9989 |
+| **1e7** | **0.8–0.9 / 1.0–1.2 m** | 0.5–0.6 m | **0.847 MB** | **0.9991** |
+
+1e6 and 2e6 fail the ~5 m bar at the southern edge. **5e6 is the real
+alternative**, and 1e7 buys one thing for its extra 0.089 MB: **bbox headroom**.
+One drought polygon west of the dateline would make a week's bbox ~358° and
+triple its pitch — 7.6 m at 5e6, which fails; 3.8 m at 1e7, which holds. Dummy
+cannot have that problem, its Aleutians being folded into a fixed 10-degree
+inset.
+
+### The USDM in geo: different gates, for a different reason
+
+**No region classifier and no `AREA_RATIO` gate.** There are no insets, so there
+is nothing to classify and nothing to clip away — both are replaced by a
+**per-class total-area comparison against the source in EPSG:6933 at 1e-4**,
+plus `assert_geo_envelope()`. Retention (≥0.99 round-trip through mapshaper),
+the D0–D4 class-set check, the object name and the `.partial` machinery are
+verbatim.
+
+**No week in this archive crosses the antimeridian.** 51 weeks sampled across it
+— 48 at stride 29 plus the three built — max bbox 110.5° wide, westernmost
+vertex 176.2 W, none crossing. `st_wrap_dateline()` is therefore a no-op here
+too, kept because the USDM is hand-drawn at ~1:2,000,000 and nothing upstream
+promises its rings stop at the line. `to_geo()`'s equal-area assert is what turns
+a future crossing into a stopped build: a split ring whose lon jumps ±179
+projects to one that girdles the planet, so the 6933 area moves enormously and
+the assert reports a real repair rather than a failure of the repair. The right
+response is to look at the source, not to loosen the tolerance.
+
+**The anchored listing regex was a dummy-path bug waiting for a geo file to
+exist.** `usdm.R` and `tools/check-usdm.R` both listed `^USDM_.*\.topojson$`,
+and `date_of()` would have read `USDM_2020-01-07-geo.topojson` as the week
+`"2020-01-07-geo"` — into the dummy index and into the skip decision. One geo
+object in the bucket was enough to corrupt both. Both listings are now
+`sprintf("^USDM_[0-9]{4}-[0-9]{2}-[0-9]{2}%s\\.topojson$", SUFFIX)` and
+`date_of()` is three subs rather than one alternation. It landed **before any
+geo file existed**, which is the only order in which it is a fix rather than a
+repair.
+
+### Rose Island, and why the geo coverage gate audits z5
+
+`60030` is 0.0998 km² of American Samoa by the archive's own `Area` column. A z4
+tile's 4,096-unit extent quantises to a ~610 m cell, 0.37 km², so the atoll has
+a quarter of one cell and no area left to encode: **3,233 of 3,234 in the
+census-geo vintages at z4**, complete from z5. Nothing dropped it — the geo
+builds pass `--no-tiny-polygon-reduction`, `--no-tile-size-limit` and
+`--no-feature-limit`, read back out of the tileset's own `generator_options` —
+so it is sub-pixel arithmetic, and it is a fact about the tiles rather than
+about the gate. Unlike dummy's z0 floor **this one is reachable**: a stock map
+framed on `GEO_FRAME` sits near z4, and genuinely lacks Rose Island there. The
+geo gate audits 5, 6, 8; dummy stays 4, 6, 8.
+
 ## Gates
 
 ```sh
-Rscript tools/check-registration.R                                # G4
-TILESET=fsa-lfp-counties      Rscript tools/check-coverage.R
-TILESET=census-counties-2020  Rscript tools/check-coverage.R
-Rscript tools/check-coverage.R                                    # dd22, default
+Rscript tools/check-registration.R                                  # G4, dummy only
+TILESET=fsa-lfp-counties          Rscript tools/check-coverage.R
+TILESET=census-counties-2020      Rscript tools/check-coverage.R
+TILESET=census-counties-2020-geo  Rscript tools/check-coverage.R
+Rscript tools/check-coverage.R                                      # dd22, default
+Rscript tools/check-usdm.R                                          # dummy
+SPACE=geo SAMPLE=6 Rscript tools/check-usdm.R
 ```
 
 `check-coverage.R` takes `TILESET` (the PMTiles basename) as well as the
 original `VINTAGE`. The **source wins wherever there is a rule for it**: for
-`census-counties-<year>` the gate re-derives the ids from the cached clipped
-parquet and re-applies the territory filter itself, rather than reading them out
-of the sidecar. A gate that trusts the build's own bookkeeping cannot catch the
-build losing a county before tippecanoe ever saw it. Everything else falls back
-to `tiles/<TILESET>-index.json`.
+`census-counties-<year>` — and for `census-counties-<year>-geo` — the gate
+re-derives the ids from the cached clipped parquet and re-applies the space's own
+territory filter itself, rather than reading them out of the sidecar. A gate that
+trusts the build's own bookkeeping cannot catch the build losing a county before
+tippecanoe ever saw it. Everything else falls back to
+`tiles/<TILESET>-index.json`.
 
 **Where both exist they are compared, and a disagreement is a failure.** That
 check is the only thing standing behind the sidecars — without it, publishing an
 index for a tileset that already had a source rule would silently demote this
 gate from "the tiles match the archive" to "the tiles match what the build said
 it wrote".
+
+**The space is derived from the name, not passed.** `TILESET` already carries the
+`-geo` suffix, so the gate reads it, and four things change with it: the drop set
+(dummy's six FIPS, geo's empty), the census source-rule regex, the audited zooms
+(4/6/8 against 5/6/8 — see Rose Island above), and the decode strategy. That
+last one is not cosmetic: the geo audit boxes are ~5,400 tiles at z8 where
+dummy's frozen box is 48, so geo runs one `tippecanoe-decode` per zoom and reads
+it as a line stream. The dummy per-tile path is textually intact.
+
+`check-usdm.R` takes `SPACE`, one space per invocation for the same reason
+`usdm.R` does: different names, a different index, a different bounds box.
+
+**Nothing in either gate is imported from `R/`.** The drop sets and the four
+geographic envelope numbers are typed again there on purpose; the zoom ceiling
+comes out of the PMTiles v3 header, the tileset itself being the only party to
+that question that cannot be wrong about it.
 
 ## Open threads
 
@@ -266,32 +536,53 @@ it wrote".
    `s3_write_manifest()` + `cf_invalidate()`. None of them did, so the first
    publish went up unlisted and `_manifest.txt` had to be written by hand. The
    invalidation uses `/<prefix>/tiles/*`, which counts as a single path.
-2. **`counties.R` still inlines a bare `st_union()` for its outline** where
-   `census.R` and `fsa-lfp-counties.R` now call `dissolve_outline()`. dd17/dd22
+2. **Nothing in `sfsa-geographic/1` is published.** The bucket holds 63 dummy
+   objects and zero geo ones. The backfill is a manual sequence, in this order
+   so the cheap ones prove the machinery before the long one starts:
+   `SPACE=geo Rscript counties.R` (6 files) → `fsa-lfp-counties.R` (3) →
+   `census.R` (54, where the incremental skip proves itself) →
+   `SPACE=geo WORKERS=6 Rscript usdm.R` (1,390 weeks and an index; hours, and
+   splittable with `DATES`). Existing wildcard invalidations cover suffixed
+   names.
+3. **The workflow's `SPACES` is still `dummy`,** deliberately: until the
+   backfill above is in the bucket, the first scheduled `SPACE=geo` run would
+   try to build the whole USDM archive inside a 350-minute timeout. The flip to
+   `dummy geo` is a one-line commit and nothing else, and afterwards a quiet
+   Thursday costs four list calls instead of two.
+4. **`counties.R` still inlines a bare `st_union()` for its dummy outline** where
+   `census.R` and `fsa-lfp-counties.R` call `dissolve_outline()`. dd17/dd22
    happen to carry no pinholes, so the two agree by luck rather than by
-   construction — adopt the helper the next time those are rebuilt.
-3. **`setup-geospatial` already provides mapshaper and tippecanoe.** The
+   construction. Its **geo** path uses the helper, so this is now the only
+   remaining caller — adopt it the next time the dummy pair is rebuilt.
+5. **`setup-geospatial` already provides mapshaper and tippecanoe.** The
    workflow only re-pins mapshaper to 0.6.113, the version usdm.R's retention
    gate was calibrated against; the shared action installs it unpinned. That pin
    is what makes a CI build byte-identical to a local one — verified end to end
    by deleting a published week and letting the workflow rebuild it: same
-   sha256, `4a4b96c7`.
-4. **The weekly cron runs `usdm.R` and `census.R`.** Both discover their inputs
-   from the upstream manifest and skip whatever the bucket already holds, so a
-   quiet week costs two list calls. `census.R` only does work in the year Census
-   posts a new vintage, and now notices that on its own rather than waiting for
-   someone to edit a hardcoded list.
+   sha256, `4a4b96c7`. Note what that verification did *not* cover: it is a
+   `usdm.R` week, which is the one script whose source needs no Parquet driver
+   read at a datum boundary. See **The toolchain decides the bytes** — nothing
+   has yet proven a CI `census.R` build byte-identical.
+6. **The weekly cron runs `usdm.R` and `census.R`, now under a `SPACES` loop.**
+   Both discover their inputs from the upstream manifest and skip whatever the
+   bucket already holds, so a quiet week costs one list call per script per
+   space. `census.R` only does work in the year Census posts a new vintage, and
+   notices that on its own rather than waiting for someone to edit a hardcoded
+   list.
 
    `counties.R` and `fsa-lfp-counties.R` are **not** scheduled and still rebuild
    unconditionally; their sources are frozen archives. A push that edits
-   `R/dummy-space.R` therefore does NOT re-tile them — the transform gates run,
-   but re-tiling stays a manual call, which is deliberate: a 1.4 GB republish
-   should not be a side effect of a commit.
-5. **Nothing masks the USDM overspill yet.** It is published unclipped by
-   design, so until `lfp-explorer` draws the inverse of the active outline above
-   it, the overlay shows the USDM's own ~1:2M coastline running past the
-   counties.
-6. **The cache policy is `public, max-age=3600`, and it used to be
+   `R/dummy-space.R` or `R/geo-space.R` therefore does NOT re-tile them — the
+   transform gates run, but re-tiling stays a manual call, which is deliberate:
+   a 1.4 GB republish should not be a side effect of a commit.
+7. **The app side of the geographic family does not exist.** Two pieces:
+   `lfp-explorer` has to draw the inverse of the active outline above the USDM,
+   which is unpublished by design in both spaces, or the overlay shows the
+   USDM's own ~1:2M coastline running past the counties; and it has to frame
+   from the sidecar's `frame_bounds` rather than from the PMTiles header, which
+   for any geo tileset containing Aleutians West spans nearly the whole Pacific.
+   Neither is written.
+8. **The cache policy is `public, max-age=3600`, and it used to be
    `immutable`.** Fixed 2026-08-22; the reasoning lives in `R/publish.R`'s
    header. Short version: `immutable` under a filename that is stable across
    rebuilds is a contradiction, those exact keys were republished twice in one
@@ -313,48 +604,3 @@ it wrote".
   2025-FSA-08431-F), and the statistics computed on them,
   `sustainable-fsa/usdm-counties-fsa-lfp`.
 - The determinations these tiles illustrate: `sustainable-fsa/usdm-counties`.
-
-## Geo family (`SPACE=geo`): the calibration numbers, measured 2026-09-01
-
-WP5's measurements, parked here for WP7 to fold into the geo-family section.
-GDAL 3.13.3 / GEOS 3.14.1 / PROJ 9.8.1, mapshaper 0.6.113, every run
-`PUBLISH=0`. **Both constants in `R/geo-space.R` were confirmed, not revised.**
-
-**`GEO_MAXZOOM = 13L`.** dd22-geo and census-counties-2020-geo built at both
-zooms; deviation is `tippecanoe-decode` of the maxzoom tiles over Guam, American
-Samoa, a PR municipio, Pinellas FL and an Alaska borough, point-to-segment
-against the build's own geojsonl in the local UTM zone, with clip artefacts (the
-tile border and tippecanoe's 5/256 buffer rect) excluded.
-
-| maxzoom | per-axis quantum | worst deviation | dd22-geo | census-2020-geo |
-|---|---|---|---|---|
-| 13 | 0.30–0.58 m | **0.42 m** (PR) | 83.2 MB (1.35x dummy) | 88.4 MB (1.36x) |
-| 12 | 0.61–1.16 m | 0.82 m (PR) | 51.6 MB (0.84x) | 54.2 MB (0.84x) |
-
-The measured deviation is 0.71 of the quantum at both zooms — half a grid
-diagonal — so **only the per-axis quantum separates them**, and that is the
-number the ≤1 m bar was written against. County ids at z4/z6/z8 are complete at
-both zooms with one exception: **census-geo loses Rose Island (60030) at z4
-only**, a 1 km² atoll against z4's ~300 m grid. It is back at z6. A coverage
-gate that enumerates ids at z4 has to know that.
-
-**`GEO_QUANTIZATION = "1e7"`.** Weeks 2013-03-05, 2019-08-27 and 2025-09-16 (the
-archive's worst) at four values. Pitch is per file from its own
-`transform.scale`; `south` is at the bbox's southern edge, where a degree of
-longitude is longest and the grid is coarsest.
-
-| q | pitch x mid / south | pitch y | worst-week gz | worst retention |
-|---|---|---|---|---|
-| 1e6 | 8.1–9.0 / 10.0–11.7 m | 4.8–5.9 m | 0.570 MB | 0.9925 |
-| 2e6 | 4.0–4.5 / 5.0–5.9 m | 2.4–2.9 m | 0.644 MB | 0.9974 |
-| 5e6 | 1.6–1.8 / 2.0–2.3 m | 1.0–1.2 m | 0.758 MB | 0.9989 |
-| **1e7** | **0.8–0.9 / 1.0–1.2 m** | 0.5–0.6 m | **0.847 MB** | **0.9991** |
-
-1e6 and 2e6 fail the ~5 m bar at the southern edge. 5e6 is the real alternative
-and 1e7 buys one thing for its extra 0.089 MB: **bbox headroom**. q is
-bbox-relative and geo week bboxes are 95–110° wide (48 weeks sampled at stride
-29, plus the three built: max 110.5°, westernmost vertex 176.2 W, none crossing
-the dateline). One drought polygon west of the line would make a week's bbox
-~358° and triple its pitch — 7.6 m at 5e6, which fails; 3.8 m at 1e7, which
-holds. Dummy cannot have that problem: its Aleutians are folded into a fixed
-10-degree inset.
