@@ -43,9 +43,20 @@ suppressPackageStartupMessages({
   library(sf); library(dplyr); library(jsonlite); library(mirai)
 })
 source("R/dummy-space.R")
+source("R/geo-space.R")
 source("R/publish.R")
 source("R/s3-archive.R")
 sf::sf_use_s2(FALSE)
+
+## ── Which space ──────────────────────────────────────────────────────────────
+## One space per invocation. The two families differ in every artifact name, so
+## a dummy run and a geo run cannot collide on a file, an index, or a bucket
+## key — which is also what makes the incremental skip per-space for free.
+## space_suffix() hard-errors on anything but "dummy" or "geo": a typo that fell
+## through to "" would rebuild the published dummy family under geo flags.
+SPACE  <- Sys.getenv("SPACE", unset = "dummy")
+SUFFIX <- space_suffix(SPACE)
+message("space: ", SPACE)
 
 ## 4.6 x 3.1 m on the ground, which retains 99.75% of source vertices — lossless
 ## against a 1:2M product. 1e5 (46 m, 92.1%) and 1e4 (461 m, 50.1%) are
@@ -107,11 +118,17 @@ dir.create("usdm", showWarnings = FALSE)
 ## ── Which weeks exist ────────────────────────────────────────────────────────
 ## From the source archive's own manifest: one request, authoritative, and no
 ## 1,390 HEAD probes to discover what a single file already lists.
-## USDM_2010-08-10.topojson -> 2010-08-10. Two subs, not one alternation:
+## USDM_2010-08-10.topojson -> 2010-08-10, and USDM_2010-08-10-geo.topojson ->
+## 2010-08-10 on a geo run. Three subs, not one alternation:
 ## sub("^USDM_|\\.topojson$", "", x) replaces only the FIRST match, so it strips
 ## the prefix and leaves the extension. That silently corrupted every date on
-## the incremental path.
-date_of <- function(f) sub("\\.topojson$", "", sub("^USDM_", "", basename(f)))
+## the incremental path. The suffix sub is a no-op on dummy — "$" matches the
+## empty string at the end — and every caller feeds it names from a listing
+## anchored on this space, so it never sees the other family's.
+date_of <- function(f) {
+  sub(paste0(SUFFIX, "$"), "",
+      sub("\\.topojson$", "", sub("^USDM_", "", basename(f))))
+}
 
 archive_dates <- function() {
   m <- readLines(file.path(USDM_ARCHIVE, "_manifest.txt"), warn = FALSE)
@@ -136,8 +153,14 @@ f_for <- function(d) file.path("usdm", sprintf("USDM_%s.topojson", d))
 ## What the bucket already holds, read once and used twice: to decide what still
 ## needs uploading, and to build an index that names the ARCHIVE rather than
 ## this disk.
+##
+## ANCHORED ON THE DATE AND ON THIS SPACE'S SUFFIX, not `USDM_.*`. The bucket
+## holds both families, and the loose pattern admits the other one: date_of()
+## then reads USDM_2020-01-07-geo.topojson as the date "2020-01-07-geo", which
+## goes into the index and into the skip decision. One geo object is enough to
+## corrupt the dummy index.
 published <- if (publish) {
-  grep("^USDM_.*\\.topojson$",
+  grep(sprintf("^USDM_[0-9]{4}-[0-9]{2}-[0-9]{2}%s\\.topojson$", SUFFIX),
        basename(s3_list_keys(s3_bucket, paste0(s3_prefix, "/usdm"))$Key),
        value = TRUE)
 } else character(0)
@@ -324,9 +347,12 @@ if (length(out))
 ## weekly cron quietly destroying the thing it exists to maintain. The bucket is
 ## the authority; local files cover the PUBLISH=0 case, where there is no bucket
 ## to ask.
+## The local listing is anchored the same way the S3 one is, and for the same
+## reason: this directory holds both families once the geo backfill has run.
 built <- sort(unique(c(
   date_of(published),
-  date_of(list.files("usdm", pattern = "\\.topojson$")),
+  date_of(list.files("usdm", pattern = sprintf(
+    "^USDM_[0-9]{4}-[0-9]{2}-[0-9]{2}%s\\.topojson$", SUFFIX))),
   vapply(out, `[[`, "", "date"))))
 idx <- list(
   schema       = jsonlite::unbox("sfsa-usdm-index/1"),
