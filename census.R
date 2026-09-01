@@ -27,7 +27,14 @@
 ## upstream, where the clipped form is asserted valid under both s2 and GEOS at
 ## build time. Read, filter, project. That is the whole job.
 ##
+## TWO SPACES, ONE PER INVOCATION. SPACE=dummy (the default) builds the
+## sfsa-albers-usa/1 family that is already published; SPACE=geo builds the
+## parallel sfsa-geographic/1 family in true EPSG:4326. Every artifact name
+## carries the space, so the two cannot collide and the incremental skip is
+## per-space without being told about spaces at all.
+##
 ##   VINTAGES=2020 PUBLISH=0 Rscript census.R
+##   SPACE=geo VINTAGES=2020 PUBLISH=0 Rscript census.R
 ## =============================================================================
 
 suppressPackageStartupMessages({
@@ -35,15 +42,38 @@ suppressPackageStartupMessages({
   library(rmapshaper); library(jsonlite)
 })
 source("R/dummy-space.R")
+source("R/geo-space.R")
 source("R/outline.R")
 source("R/s3-archive.R")
 source("R/publish.R")
 sf::sf_use_s2(FALSE)
 options(tigris_use_cache = TRUE)
 
-MAXZOOM  <- 15L
+## space_suffix() hard errors on anything but "dummy" or "geo": a typo that fell
+## through to the empty suffix would rebuild and republish the dummy family
+## under a geo run's flags.
+SPACE  <- Sys.getenv("SPACE", unset = "dummy")
+SUFFIX <- space_suffix(SPACE)
+message("space: ", SPACE)
+
+## THE BAR ON MAXZOOM IS GROUND RESOLUTION, NOT ZOOM NUMBER. Dummy z15 at
+## detail 13 quantises to 0.720 m of CONUS ground; real Web Mercator reaches
+## that at z13, worst case 0.597 m at the equator. The geo value lives in
+## R/geo-space.R and WP5's calibration may revise it — this script must not
+## carry a second copy of it.
+MAXZOOM  <- if (SPACE == "geo") GEO_MAXZOOM else 15L
 DETAIL   <- 13L
 SIMPLIFY <- 0.5
+
+## GeoJSONL writer options for both layers. 9 dp was chosen against DUMMY
+## degrees, where GDAL's default 7 would have been fine (5 cm) but only by luck;
+## on real degrees 7 dp is 1.1 cm, finer than anything the source resolves, so
+## the geo intermediates do not carry two digits tippecanoe discards. RFC7946=NO
+## in both: dummy coordinates are not lng/lat and must not be normalised as
+## such, and in geo it is what keeps the precision this line states rather than
+## the 7 dp and ring rewinding RFC7946 would impose on its own terms.
+LAYER_OPTS <- c(sprintf("COORDINATE_PRECISION=%d", if (SPACE == "geo") 7L else 9L),
+                "RFC7946=NO")
 
 ## DISCOVERED, NOT HARDCODED, for the same reason census-counties discovers
 ## them: a hardcoded list cannot notice the year Census publishes a new vintage,
@@ -61,7 +91,18 @@ archive_vintages <- function() {
 
 ## Territories the composite cannot place: dummy-Albers lays out CONUS, AK, HI
 ## and PR only. The archive carries these counties, so the filter is ours.
-DROP_STATES <- c("60", "78", "14", "52", "69", "66")
+##
+## THE GEO FAMILY DROPS NOTHING. Real degrees place American Samoa, Guam, the
+## Northern Marianas and the US Virgin Islands where they actually are, so the
+## only reason the filter existed is gone with the composite. The codes are still
+## named because the geo mask_year rule below is stated over them: these are the
+## rows allowed to disagree with the rest of the vintage about which coastline
+## cut them. (52 and 14 are the legacy US Virgin Islands and Guam codes the FSA
+## composite uses; the Census parquets carry 60/66/69/78 only, and the set is
+## shared with counties.R because a short set that is wrong in one script is
+## worse than a long one that is right in both.)
+TERRITORY_STATES <- c("60", "78", "14", "52", "69", "66")
+DROP_STATES <- if (SPACE == "geo") character(0) else TERRITORY_STATES
 
 ## State NAMES only — no geometry — so this is a lookup table, not a boundary.
 ## Pinned anyway, for the same reason counties.R pins its mask year: an unpinned
@@ -123,10 +164,21 @@ message(length(vintages), " vintage(s) in scope")
 ## Without this the script rebuilt every vintage every run: half an hour and
 ## 1.2 GB republished to produce byte-identical output, which is why the weekly
 ## workflow could not afford to call it.
-artifacts_for <- function(y) file.path("tiles", c(
-  sprintf("census-counties-%d.pmtiles", y),
-  sprintf("census-counties-%d-index.json", y),
-  sprintf("census-counties-%d-outline-dummy.geojson", y)))
+##
+## THE SUFFIX IS WHAT MAKES ALL OF THAT PER-SPACE FOR FREE. A geo run listing a
+## bucket that holds only dummy keys sees nothing of its own and builds; a dummy
+## run is unaffected by however much geo is on disk. The outline is the one name
+## that is not a suffix insertion — the dummy family published -outline-dummy
+## before there was a second space and those keys cannot move — so it is stated
+## once here rather than twice.
+outline_for <- function(y) file.path("tiles", if (SPACE == "geo")
+  sprintf("census-counties-%d-geo-outline.geojson", y)
+  else sprintf("census-counties-%d-outline-dummy.geojson", y))
+
+artifacts_for <- function(y) c(file.path("tiles", c(
+  sprintf("census-counties-%d%s.pmtiles", y, SUFFIX),
+  sprintf("census-counties-%d%s-index.json", y, SUFFIX))),
+  outline_for(y))
 
 published <- if (publish) {
   basename(s3_list_keys(s3_bucket, paste0(s3_prefix, "/tiles"))$Key)
@@ -194,11 +246,34 @@ build_vintage <- function(y) {
   ## above has already dropped all 13, so one value survives — but take it from
   ## the data rather than from a fallback table this repo would have to maintain
   ## in parallel with census-counties'.
-  mask_year <- unique(x$mask_year)
-  if (length(mask_year) != 1L)
-    stop("mask_year is not single-valued after the territory filter: ",
-         paste(sort(mask_year), collapse = ", "),
-         " — the clip mask composition changed upstream", call. = FALSE)
+  ##
+  ## THE GEO FAMILY KEEPS THOSE 13 COUNTIES, so single-valued is no longer a
+  ## fact to assert — on 2009 and 2011 the vintage genuinely carries two mask
+  ## years. The rule that replaces it is the same statement in the only form
+  ## still true: every row that is NOT a territory shares one mask year, that
+  ## value is the scalar the sidecar and the tileset description carry, and a
+  ## second value is tolerated only on territory rows. Anything else is the clip
+  ## mask composition changing upstream, which is the failure the assert exists
+  ## for, and it stops the build in both spaces. The full set goes out as
+  ## `mask_years` so the scalar hides nothing.
+  if (SPACE == "geo") {
+    mask_years <- sort(unique(x$mask_year))
+    core <- unique(x$mask_year[!x$stfips %in% TERRITORY_STATES])
+    if (length(core) != 1L)
+      stop("mask_year is not single-valued across the states and DC: ",
+           paste(sort(core), collapse = ", "),
+           " — the clip mask composition changed upstream", call. = FALSE)
+    mask_year <- core
+    if (length(mask_years) > 1L)
+      message("  mask years: ", paste(mask_years, collapse = ", "),
+              " — cb ", mask_year, " everywhere but the territories")
+  } else {
+    mask_year <- unique(x$mask_year)
+    if (length(mask_year) != 1L)
+      stop("mask_year is not single-valued after the territory filter: ",
+           paste(sort(mask_year), collapse = ", "),
+           " — the clip mask composition changed upstream", call. = FALSE)
+  }
   if (mask_year != y) message("  cb ", y, " does not exist; clipped with cb ", mask_year)
 
   ## st_cast, and not for tidiness: albers_usa_shift() clips Hawaii to the
@@ -208,23 +283,30 @@ build_vintage <- function(y) {
   ## sfc_GEOMETRY, and st_coordinates() below has no method for it. The cast
   ## also fails loudly if the bbox clip ever yields a GEOMETRYCOLLECTION, which
   ## is the behaviour to want.
-  x <- albers_usa_shift(x, state_fips = x$stfips) |>
-    sf::st_make_valid() |>
-    sf::st_cast("MULTIPOLYGON")
-  x <- to_dummy(as_5070(x))
-  assert_dummy_bounds(x)
-  sf::st_crs(x) <- 4326                    # writer-boundary label; see counties.R
+  ##
+  ## The geo branch is st_transform and nothing else: no shift, no 5070 hop, no
+  ## bbox clip, and no CRS relabel because the label is true. No cast either —
+  ## to_geo() returns MULTIPOLYGON throughout, having dealt with the same mixed
+  ## column on its own side of the wrap.
+  if (SPACE == "geo") {
+    x <- to_geo(x)
+  } else {
+    x <- albers_usa_shift(x, state_fips = x$stfips) |>
+      sf::st_make_valid() |>
+      sf::st_cast("MULTIPOLYGON")
+    x <- to_dummy(as_5070(x))
+    assert_dummy_bounds(x)
+    sf::st_crs(x) <- 4326                  # writer-boundary label; see counties.R
+  }
   x$year <- y
 
   ## ── Layer 1: the counties ─────────────────────────────────────────────────
-  ## COORDINATE_PRECISION=9 is explicit: GDAL's GeoJSON writer defaults to 7,
-  ## which happens to be fine here (1e-7 dummy degrees is 5 cm) but only by
-  ## luck. RFC7946=NO because these are not real lng/lat and must not be
-  ## normalised as such.
-  f_counties <- file.path("build", sprintf("census-%d-counties.geojsonl", y))
+  ## The writer options are per-space and stated once at the top; neither
+  ## precision is GDAL's default, deliberately.
+  f_counties <- file.path("build", sprintf("census-%d%s-counties.geojsonl", y, SUFFIX))
   x |> dplyr::select(id, state, county, year) |>
     sf::st_write(f_counties, driver = "GeoJSONSeq", delete_dsn = TRUE, quiet = TRUE,
-                 layer_options = c("COORDINATE_PRECISION=9", "RFC7946=NO"))
+                 layer_options = LAYER_OPTS)
   nv <- nrow(sf::st_coordinates(x))
   message(sprintf("  vertices: %s   geojsonl %.0f MB", format(nv, big.mark = ","),
                   file.size(f_counties) / 1048576))
@@ -234,21 +316,30 @@ build_vintage <- function(y) {
   ## derives this client-side with topojson.mesh() and MVT has no equivalent.
   ## Dissolved by the state FIPS the data carries, not by substr(id) — same
   ## answer here, but the column is the honest source.
-  f_states <- file.path("build", sprintf("census-%d-states.geojsonl", y))
+  f_states <- file.path("build", sprintf("census-%d%s-states.geojsonl", y, SUFFIX))
   states_g <- x |>
     dplyr::group_by(stfips) |>
     dplyr::summarise(.groups = "drop") |>
     sf::st_make_valid()
   rmapshaper::ms_innerlines(states_g) |>
     sf::st_write(f_states, driver = "GeoJSONSeq", delete_dsn = TRUE, quiet = TRUE,
-                 layer_options = c("COORDINATE_PRECISION=9", "RFC7946=NO"))
+                 layer_options = LAYER_OPTS)
   message("  states: ", nrow(states_g), " dissolved")
 
   ## ── The national outline ──────────────────────────────────────────────────
   ## Vintage-matched like everything else here: the USDM week that clips against
   ## this one has to clip against the coastline of its own year.
-  f_outline <- file.path("tiles", sprintf("census-counties-%d-outline-dummy.geojson", y))
-  write_outline(dissolve_outline(x), f_outline)
+  ##
+  ## The pinhole guard measures rings in square metres, so the measure is the
+  ## caller's to supply: the dummy one is planar deg2 scaled by DUMMY$deg_m and
+  ## on real degrees it is not merely imprecise but wrong by a factor of two
+  ## between the equator and 60 N.
+  f_outline <- outline_for(y)
+  if (SPACE == "geo") {
+    write_outline(dissolve_outline(x, ring_m2 = geo_ring_m2), f_outline)
+  } else {
+    write_outline(dissolve_outline(x), f_outline)
+  }
 
   ## ── The index sidecar ─────────────────────────────────────────────────────
   ## Same schema as the dd17/dd22 and fsa-lfp-counties sidecars, and a hard
@@ -262,40 +353,81 @@ build_vintage <- function(y) {
   ## 2009 and 2011 are cut at cb 2010 and 2012 at cb 2013 — and the app has no
   ## other way to know it. Additive: a reader of sfsa-county-index/1 that does
   ## not know either key is unaffected.
-  bxs <- do.call(rbind, lapply(sf::st_geometry(x), function(gi) as.numeric(sf::st_bbox(gi))))
-  idx <- list(
-    schema    = jsonlite::unbox("sfsa-county-index/1"),
-    space     = jsonlite::unbox(SFSA_SPACE),
-    vintage   = jsonlite::unbox(as.character(y)),
-    mask_year = jsonlite::unbox(mask_year),
-    n         = jsonlite::unbox(nrow(x)),
-    bounds    = as.numeric(DUMMY$bounds[c("xmin", "ymin", "xmax", "ymax")]),
-    tiles     = list(
-      url      = jsonlite::unbox(sprintf("census-counties-%d.pmtiles", y)),
-      minzoom  = jsonlite::unbox(0L),
-      maxzoom  = jsonlite::unbox(MAXZOOM),
-      extent   = jsonlite::unbox(8192L),
-      layers   = list(counties = jsonlite::unbox("counties"),
-                      states   = jsonlite::unbox("states"))
+  ##
+  ## Three more in the geo family, all additive again. `crs` because a space
+  ## token names a versioned contract — wrapping and bbox convention and frame
+  ## bounds — and not a projection, so an app that wants only the projection
+  ## should not have to know the contract. `frame_bounds` because a `bounds`
+  ## measured off geometry that includes Guam and American Samoa is honest and
+  ## nearly world-wide, and fitBounds() on it opens over the Pacific.
+  ## `mask_years` because the scalar now describes everything but the
+  ## territories and they are entitled to disagree with it.
+  bxs <- if (SPACE == "geo") {
+    ## WRAPPED, not plain. Aleutians West (02016) has parts on both sides of the
+    ## antimeridian; its plain st_bbox() is arithmetically right and 359 degrees
+    ## wide, which every consumer of this file reads as the whole Pacific. See
+    ## R/geo-space.R — x0 comes back below -180 and that is the convention.
+    wrapped_bboxes(x)
+  } else {
+    do.call(rbind, lapply(sf::st_geometry(x), function(gi) as.numeric(sf::st_bbox(gi))))
+  }
+  geo_extra <- if (SPACE == "geo") list(
+    crs          = jsonlite::unbox("EPSG:4326"),
+    frame_bounds = as.numeric(GEO_FRAME[c("xmin", "ymin", "xmax", "ymax")]),
+    mask_years   = as.integer(mask_years)
+  ) else list()
+  idx <- c(
+    list(
+      schema    = jsonlite::unbox("sfsa-county-index/1"),
+      space     = jsonlite::unbox(if (SPACE == "geo") GEO_SPACE else SFSA_SPACE),
+      vintage   = jsonlite::unbox(as.character(y)),
+      mask_year = jsonlite::unbox(mask_year),
+      n         = jsonlite::unbox(nrow(x)),
+      ## Measured for geo, frozen for dummy: the composite's box is the frame
+      ## the app's ?lng/?lat is expressed against, and the geo family states
+      ## that separately as frame_bounds. Taken from the rows rather than from
+      ## st_bbox(x) so the file is internally consistent — the aggregate is the
+      ## union of the wrapped boxes it publishes, which st_bbox() of the whole
+      ## set is not.
+      bounds    = if (SPACE == "geo")
+        round(c(min(bxs[, 1]), min(bxs[, 2]), max(bxs[, 3]), max(bxs[, 4])), 6)
+      else as.numeric(DUMMY$bounds[c("xmin", "ymin", "xmax", "ymax")]),
+      tiles     = list(
+        url      = jsonlite::unbox(sprintf("census-counties-%d%s.pmtiles", y, SUFFIX)),
+        minzoom  = jsonlite::unbox(0L),
+        maxzoom  = jsonlite::unbox(MAXZOOM),
+        extent   = jsonlite::unbox(8192L),
+        layers   = list(counties = jsonlite::unbox("counties"),
+                        states   = jsonlite::unbox("states"))
+      )
     ),
-    counties     = x$id,
-    county_names = x$county,
-    state_names  = x$state,
-    ## Index-aligned bbox columns, 6 dp (0.54 m). Parallel arrays rather than
-    ## objects, matching the house payload convention.
-    x0 = round(bxs[, 1], 6), y0 = round(bxs[, 2], 6),
-    x1 = round(bxs[, 3], 6), y1 = round(bxs[, 4], 6)
+    geo_extra,
+    list(
+      counties     = x$id,
+      county_names = x$county,
+      state_names  = x$state,
+      ## Index-aligned bbox columns, 6 dp (0.54 m dummy, 11 cm real). Parallel
+      ## arrays rather than objects, matching the house payload convention.
+      x0 = round(bxs[, 1], 6), y0 = round(bxs[, 2], 6),
+      x1 = round(bxs[, 3], 6), y1 = round(bxs[, 4], 6)
+    )
   )
-  f_index <- file.path("tiles", sprintf("census-counties-%d-index.json", y))
+  f_index <- file.path("tiles", sprintf("census-counties-%d%s-index.json", y, SUFFIX))
   jsonlite::write_json(idx, f_index, auto_unbox = FALSE, digits = NA)
   message("  index: ", nrow(x), " counties, ", round(file.size(f_index) / 1024), " KB")
 
-  f_pm <- file.path("tiles", sprintf("census-counties-%d.pmtiles", y))
+  f_pm <- file.path("tiles", sprintf("census-counties-%d%s.pmtiles", y, SUFFIX))
+  desc <- if (SPACE == "geo") sprintf(
+    paste("%s - tl_%d geometry clipped to the cb %d 500k waterline,",
+          "true-position EPSG:4326, antimeridian-wrapped.",
+          "Renders on standard maps including globe."),
+    GEO_SPACE, y, mask_year) else sprintf(
+    "%s - tl_%d geometry clipped to the cb %d 500k waterline. NOT a geographic CRS.",
+    SFSA_SPACE, y, mask_year)
   args <- c(
     sprintf("--output=%s", f_pm), "--force",
-    sprintf("--name=Census counties %d", y),
-    sprintf("--description=%s - tl_%d geometry clipped to the cb %d 500k waterline. NOT a geographic CRS.",
-            SFSA_SPACE, y, mask_year),
+    sprintf("--name=Census counties %d%s", y, SUFFIX),
+    sprintf("--description=%s", desc),
     "--attribution=U.S. Census Bureau TIGER/Line; Sustainable FSA archive",
     sprintf("--named-layer=counties:%s", f_counties),
     sprintf("--named-layer=states:%s", f_states),
@@ -306,7 +438,10 @@ build_vintage <- function(y) {
     "--no-tiny-polygon-reduction", "--no-tile-size-limit", "--no-feature-limit",
     "--include=id", "--include=state", "--include=county", "--include=year",
     "--attribute-type=year:int",
-    "--clip-bounding-box=-5.02,-3.06,5.02,3.06",
+    ## No clip box in the geo family: the dummy one is the frozen composite
+    ## frame, and there is no geographic equivalent — the extent is the world
+    ## once Guam and American Samoa are in it, so any box would cut them off.
+    if (SPACE == "geo") character(0) else "--clip-bounding-box=-5.02,-3.06,5.02,3.06",
     "--no-tile-stats", "--read-parallel"
   )
   if (system2("tippecanoe", shQuote(args)) != 0)
