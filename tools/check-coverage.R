@@ -65,6 +65,14 @@ if (!nzchar(TILESET))
 
 SPACE   <- if (grepl("-geo$", TILESET)) "geo" else "dummy"
 
+## The audited layer follows the family the same way the space follows the
+## suffix: the county tilesets carry their ids in a `counties` layer,
+## census-aiannh-<year> in `aiannh`. Derived from the name because the name is
+## the only thing a caller passes — a wrong layer here decodes cleanly and
+## reports every feature missing at once, which is the same failure mode as a
+## wrong zoom and gets the same treatment.
+LAYER   <- if (grepl("^census-aiannh-", TILESET)) "aiannh" else "counties"
+
 ## THE AUDITED ZOOMS ARE PER SPACE, AND THE GEO FLOOR IS Z5. Same physics as z0
 ## in dummy space, one zoom higher and for one county: at z4 the world is 16 tiles
 ## across, so a tile's 4,096-unit extent quantises to a 610 m cell — 0.37 km2 —
@@ -72,8 +80,19 @@ SPACE   <- if (grepl("-geo$", TILESET)) "geo" else "dummy"
 ## quarter of one. Measured on census-counties-2020-geo: 3,233 of 3,234 at z4,
 ## complete from z5 up. Dummy space never met this because it drops the
 ## territories, and everything it does carry clears its quantum by z4.
+## THE AIANNH FLOORS ARE ELSEWHERE, and for the same physics scaled down: the
+## smallest off-reservation trust parcel is Swinomish 4075T, 304 m2 of land —
+## three orders below Rose Island — so completeness arrives late. Measured on
+## the 2025 build (2026-09-01): dummy carries 274 of 867 at z0, misses only
+## 4075T at z8-z9 and is complete from z10; geo misses three T parcels (1400T,
+## 4075T, 5196T) at z5 and is complete from z6. The dummy floor sits above the
+## geo one because the composite compresses CONUS into a 10-degree box, so a
+## parcel spans ~5.8x fewer tile units at the same zoom.
 ZOOMS   <- as.integer(strsplit(
-  Sys.getenv("ZOOMS", if (SPACE == "geo") "5,6,8" else "4,6,8"),
+  Sys.getenv("ZOOMS",
+    if (grepl("^census-aiannh-", TILESET)) {
+      if (SPACE == "geo") "6,8,10" else "10,12,14"
+    } else if (SPACE == "geo") "5,6,8" else "4,6,8"),
   "[, ]+")[[1]])
 PMTILES <- file.path("tiles", paste0(TILESET, ".pmtiles"))
 INDEX   <- file.path("tiles", paste0(TILESET, "-index.json"))
@@ -121,11 +140,16 @@ DROP_STATES <- if (SPACE == "geo") character(0) else
   c("60", "78", "14", "52", "69", "66")
 
 ## Expected ids, and a name per id for the failure message.
+## sfsa-county-index/1 carries counties/county_names and sfsa-aiannh-index/1
+## carries areas/area_names — the same two parallel arrays under different
+## nouns, so the reader takes whichever pair is present.
 expected_from_index <- function() {
   idx <- jsonlite::fromJSON(INDEX)
-  if (length(unique(idx$counties)) != idx$n)
+  ids <- if (!is.null(idx$areas)) idx$areas else idx$counties
+  nms <- if (!is.null(idx$area_names)) idx$area_names else idx$county_names
+  if (length(unique(ids)) != idx$n)
     stop("check-coverage: the index carries DUPLICATE ids (", idx$n, " rows, ",
-         length(unique(idx$counties)), " distinct). Dissolve by id alone.",
+         length(unique(ids)), " distinct). Dissolve by id alone.",
          call. = FALSE)
   ## The sidecar's tiles.maxzoom is what the app requests and the header is what
   ## exists; both are here, so they are compared. A sidecar written beside a
@@ -135,7 +159,7 @@ expected_from_index <- function() {
   if (length(idx$tiles$maxzoom) && idx$tiles$maxzoom != TZ[["maxzoom"]])
     stop("check-coverage: the sidecar says maxzoom ", idx$tiles$maxzoom,
          " and the PMTiles header says ", TZ[["maxzoom"]], ".", call. = FALSE)
-  stats::setNames(idx$counties, idx$county_names)
+  stats::setNames(ids, nms)
 }
 
 expected_from_census <- function(year) {
@@ -150,6 +174,20 @@ expected_from_census <- function(year) {
                   as.character(p$County))
 }
 
+## The same cached zip census-aiannh.R read, re-derived here. NOTHING IS
+## DROPPED IN EITHER SPACE — AIANNH covers the 50 states only, so even
+## dummy-Albers has somewhere to put all 867 components — and that empty drop
+## set is stated by this comment rather than imported, like DROP_STATES above.
+expected_from_aiannh <- function(year) {
+  f <- file.path("build", "aiannh", sprintf("tl_%s_us_aiannh.zip", year))
+  if (!file.exists(f))
+    stop("check-coverage: ", f, " is not cached — run\n",
+         "  VINTAGES=", year, " PUBLISH=0 Rscript census-aiannh.R\n",
+         "first, or point AIANNH_", year, " at a local copy.", call. = FALSE)
+  p <- sf::st_drop_geometry(sf::read_sf(paste0("/vsizip/", f)))
+  stats::setNames(as.character(p$GEOID), as.character(p$NAMELSAD))
+}
+
 from_index <- if (file.exists(INDEX)) expected_from_index() else NULL
 
 ## Both families read the same cached parquet; only the drop set differs, which
@@ -157,6 +195,9 @@ from_index <- if (file.exists(INDEX)) expected_from_index() else NULL
 from_source <- if (grepl("^census-counties-[0-9]{4}(-geo)?$", TILESET)) {
   suppressPackageStartupMessages(library(arrow))
   expected_from_census(sub("-geo$", "", sub("^census-counties-", "", TILESET)))
+} else if (grepl("^census-aiannh-[0-9]{4}(-geo)?$", TILESET)) {
+  suppressPackageStartupMessages(library(sf))
+  expected_from_aiannh(sub("-geo$", "", sub("^census-aiannh-", "", TILESET)))
 } else NULL
 
 if (is.null(from_index) && is.null(from_source))
@@ -189,7 +230,11 @@ if (!is.null(from_index) && !is.null(from_source)) {
 ## Northern Marianas or USVI, so the 2000 and 2010 clipped vintages carry no
 ## territory rows at all and a fixed expectation would fail on correct data. The
 ## assertion is the comparison above; this is the evidence for reading it.
-if (SPACE == "geo" && !is.null(from_source) && !is.null(from_index)) {
+## Counties only: an AIANNH GEOID's first two characters are census-code
+## digits, not a state FIPS — the ANVSA range starts at 6000, so "60xx" would
+## match here and report Alaska villages as American Samoa.
+if (SPACE == "geo" && !is.null(from_source) && !is.null(from_index) &&
+    grepl("^census-counties-", TILESET)) {
   terr <- function(v) v[substr(v, 1, 2) %in% c("60", "66", "69", "78")]
   ts <- terr(unname(from_source))
   cat(sprintf("  territories: %d in the archive, %d in the sidecar%s\n",
@@ -205,7 +250,8 @@ if (SPACE == "geo" && !is.null(from_source) && !is.null(from_index)) {
 expected <- if (!is.null(from_source)) from_source else from_index
 
 total <- unique(unname(expected))
-cat(sprintf("%s: %d counties expected\n", TILESET, length(total)))
+cat(sprintf("%s: %d feature(s) expected in layer '%s'\n",
+            TILESET, length(total), LAYER))
 if (length(total) != length(expected))
   stop("check-coverage: the source carries DUPLICATE ids (", length(expected),
        " rows, ", length(total), " distinct). Dissolve by id alone.", call. = FALSE)
@@ -229,7 +275,7 @@ ids_at <- function(z) {
     d <- try(jsonlite::fromJSON(paste(out, collapse = "\n"), simplifyVector = FALSE), silent = TRUE)
     if (inherits(d, "try-error")) next
     for (lay in d$features) {
-      if (!identical(lay$properties$layer, "counties")) next
+      if (!identical(lay$properties$layer, LAYER)) next
       for (f in lay$features) {
         id <- f$properties$id
         if (!is.null(id)) seen <- c(seen, id)
@@ -270,6 +316,16 @@ GEO_BOXES <- list(
   amer_samoa     = c(w = -171.2, s = -14.6, e = -168.1, n = -11.0)
 )
 
+## THE AIANNH FAMILY TAKES THE STREAMED PATH IN BOTH SPACES. Its dummy floor is
+## z10 (see ZOOMS), and the per-tile decode above is 8,000 subprocesses at z12
+## and 127,000 at z14 — the tile-count regime the streamed decoder was written
+## for, arrived at from the other direction. The box is the frozen composite
+## frame with the same slack tiles_for() pads its degrees with, stated here for
+## the same reason GEO_BOXES is.
+BOXES <- if (SPACE == "geo") GEO_BOXES else
+  list(composite = c(w = -5.02, s = -3.04, e = 5.02, n = 3.04))
+STREAMED <- SPACE == "geo" || grepl("^census-aiannh-", TILESET)
+
 ## Integer tile ranges per box, with a tile of slack on every side the way
 ## tiles_for() pads its degrees. Ranges rather than an enumerated key set:
 ## membership becomes four comparisons, and at maxzoom the enumeration would be
@@ -279,8 +335,8 @@ geo_ranges <- function(z) {
   xt <- function(lon) floor((lon + 180) / 360 * n)
   yt <- function(lat) floor((1 - asinh(tan(lat * pi / 180)) / pi) / 2 * n)
   cl <- function(v) pmin(pmax(v, 0), n - 1)
-  do.call(rbind, lapply(names(GEO_BOXES), function(nm) {
-    b <- GEO_BOXES[[nm]]
+  do.call(rbind, lapply(names(BOXES), function(nm) {
+    b <- BOXES[[nm]]
     data.frame(box = nm,
                x0 = cl(xt(b[["w"]]) - 1), x1 = cl(xt(b[["e"]]) + 1),
                y0 = cl(yt(b[["n"]]) - 1), y1 = cl(yt(b[["s"]]) + 1),
@@ -365,7 +421,7 @@ ids_at_geo <- function(z) {
     lb_all <- c(carry_lay, lb)
     ti <- cumsum(is_tile)
     li <- cumsum(is_lay)
-    sel <- which(has_id & !is_tile & !is_lay & lb_all[li + 1L] == "counties")
+    sel <- which(has_id & !is_tile & !is_lay & lb_all[li + 1L] == LAYER)
     if (length(sel)) {
       ids  <- sub('^.*"id": "([^"]*)".*$', "\\1", ln[sel])
       rows <- ti[sel] + 1L
@@ -392,7 +448,7 @@ ids_at_geo <- function(z) {
 
 bad <- integer(0)
 for (z in ZOOMS) {
-  r <- if (SPACE == "geo") ids_at_geo(z) else ids_at(z)
+  r <- if (STREAMED) ids_at_geo(z) else ids_at(z)
   miss <- setdiff(total, r$ids)
   cat(sprintf("  z%-2d %4d tiles   present %5d   missing %4d%s\n",
               z, r$ntiles, length(r$ids), length(miss),
@@ -414,9 +470,9 @@ for (z in ZOOMS) {
 }
 
 if (length(bad)) {
-  stop("check-coverage: counties missing at zoom(s) ", paste(bad, collapse = ", "),
+  stop("check-coverage: features missing at zoom(s) ", paste(bad, collapse = ", "),
        ".\n  A choropleth with holes still looks like a map — this is the failure\n",
        "  that hides. Check for --drop-*, --coalesce-*, or a tile-size limit.",
        call. = FALSE)
 }
-cat("\ncheck-coverage: OK — every county present at every audited zoom\n")
+cat("\ncheck-coverage: OK — every feature present at every audited zoom\n")

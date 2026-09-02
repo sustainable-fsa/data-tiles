@@ -10,6 +10,7 @@ up to 765 m with nothing on screen to show it.
 ```
 counties.R            FSA county tiles (dd17/dd22) + composite
 census.R              vintage-matched Census county tiles, 18 vintages
+census-aiannh.R       Census Native Areas (AIANNH), PMTiles + TopoJSON
 fsa-lfp-counties.R    the NDMC/FSA LFP determination boundaries
 usdm.R                the weekly USDM, 1,390 weeks of TopoJSON
 R/dummy-space.R       the AlbersUSA shift and dummy-space transform
@@ -258,6 +259,94 @@ and it is 5% smaller. Flags otherwise match `fsa-counties-dd22.R:156-166`,
 including `fix-geometry` — quantisation is a snap, and a snap can push a ring
 into itself.
 
+## census-aiannh.R: the Native Areas, and the only script that emits both encodings
+
+The Census AIANNH areas (American Indian reservations, off-reservation trust
+lands, Oklahoma tribal statistical areas, Alaska Native village statistical
+areas, Hawaiian home lands) as PMTiles **and** TopoJSON, both spaces. At ~891 K
+source vertices the dataset sits between the counties (tiles or nothing) and a
+USDM week (TopoJSON or waste), so it gets census.R's PMTiles stage and usdm.R's
+TopoJSON stage. Three artifacts per space —
+`census-aiannh-2025[-geo].pmtiles` / `-index.json` / `.topojson`, all in
+`tiles/` — plain `space_suffix()` insertion throughout, no outline-name legacy.
+
+**The source is TIGER/Line, not the cb file, and that is a finding.**
+`cb_<y>_us_aiannh_500k` pre-dissolves each area's reservation and trust-land
+components into one feature — 704 features, no `COMPTYP`, checked on cb 2020,
+2022 and 2024 — so the cb form cannot distinguish trust lands at all.
+`tl_2025_us_aiannh` carries 867 records: 617 reservation/statistical-area
+components (`COMPTYP` "R") + 250 trust-land components ("T") over 704
+`AIANNHCE` codes, `GEOID` the 4-digit code plus the letter. Cached under
+`build/aiannh/`, which the gates read back.
+
+**One tileset per space, with `comptyp` as the with/without switch.** The R and
+T components stay separate features; an app filters `comptyp == "R"` to hide
+trust lands. **That filter hides the 74 Hawaiian home lands too** — Census
+codes every one of them "T", which is what they legally are — so it means
+"reservations and statistical areas", not "everything but the ORTLs".
+
+**Clipped here at cb 2025 500k, the source's own year, pinned** (`MASK_YEAR`),
+with counties.R's `st_union() |> st_make_valid()` idiom and a direct pinned
+URL rather than tigris. The clip keeps 0.9831 of source vertices (TIGER runs
+past the coastline; that loss is the clip working) and **every one of the 867
+components must survive it non-empty** — a component wholly seaward would be a
+real disagreement between two Census products and stops the build. A future
+`VINTAGES` entry needs a deliberate `MASK_YEAR` decision, not a silent reuse.
+
+**The dummy branch is usdm.R's, not census.R's**: AIANNH carries no state FIPS
+— the Navajo Nation spans three states, Alaska is full of ANVSAs — so
+placement is `classify_regions()` over exploded polygons, then the per-region
+`AREA_RATIO` gate, then a dissolve back by id. Nothing is dropped in either
+space: AIANNH covers the 50 states only (no territories, no PR, and nothing
+crosses the antimeridian — extent −174.24..−67.04). `name` is `NAMELSAD`
+verbatim, the fsa-lfp lesson again.
+
+**Dummy TopoJSON quantization is 5e6, not the USDM's 1e6**, and the ladder is
+the reason (measured 2026-09-01, dummy space): 1e6 — a 4.6 × 3.1 m grid —
+retains 0.9880 of this TIGER-resolution geometry and fails the 0.99 floor that
+the ~1:2M USDM sails through; 2e6 → 0.9975 / 1.75 MB gz; **5e6 → 0.9994 /
+2.11 MB**; 1e7 → 0.9994 / 2.38 MB. 5e6 is a 0.92 × 0.62 m grid, the same
+resolution class as the tile family's z15 quantum, and 1e7 buys zero retention
+for +0.27 MB. Geo keeps `GEO_QUANTIZATION = 1e7` (0.8–1.2 m over its box,
+retained 0.9994). Both spaces: mapshaper with topology ON, `id-field=id` (the
+dd22 usage — these features have ids), `fix-geometry`, `bbox`, the `.partial`
+rename, and the ≥0.99 round-trip gate against the post-transform count.
+
+**Swinomish 4075T is this family's Rose Island, three orders down**: 304 m² of
+land, so the completeness floors sit high. Measured on the 2025 build: dummy
+carries 274 of 867 at z0, misses only 4075T at z8–z9 and is **complete from
+z10**; geo misses three T parcels (1400T, 4075T, 5196T) at z5 and is **complete
+from z6**. Dummy's floor is above geo's because the composite compresses CONUS
+into 10 degrees. So `check-coverage.R` audits 10/12/14 (dummy) and 6/8/10
+(geo), and **the AIANNH family takes the streamed one-decode-per-zoom path in
+both spaces** — z12 is 8,000 per-tile subprocesses and z14 is 127,000, the
+regime the streamed decoder was written for — with the dummy composite box as
+its single range. The county tilesets' per-tile dummy path is textually intact.
+
+Measured, full build (2026-09-01): dummy 875,839 vertices post-clip, 8.5 MB
+PMTiles, 6.87 MB TopoJSON; geo 875,849 / 12.3 MB / 6.83 MB; net TopoJSON
+retention vs the source zip 0.9826 in both spaces (clip 0.9831 × round trip
+0.9994), which is what `tools/check-aiannh.R`'s 0.97 floor was written
+against.
+
+The sidecar schema is **`sfsa-aiannh-index/1`**: the county shape with the
+arrays renamed (`areas`, `area_names`, plus `aiannhce` and `comptyp`) and an
+additive `topojson {url, object, quantization}` block pointing at the sibling
+encoding. `check-coverage.R` reads whichever array pair a sidecar carries and
+re-derives the expected set from the cached TIGER zip; `check-aiannh.R` is the
+TopoJSON's independent gate, retention measured against the source. **No
+outline artifact** (AIANNH is never the county authority the USDM is clipped
+to) and **no innerlines layer** (the areas are not a partition of the plane).
+**Not scheduled**: TIGER vintages are annual and frozen; adding one is a
+`VINTAGES` edit and a manual run, like counties.R.
+
+**Published 2026-09-01** (both spaces, six objects to
+`s3://sustainable-fsa/data-tiles/tiles/`), verified over the CDN the same day:
+correct content types, `public, max-age=3600`, HTTP 206 on a ranged PMTiles
+GET with no `Content-Encoding`, all six in `_manifest.txt`, and
+`check-aiannh.R` run in remote mode against the published bytes in both
+spaces. The bytes uploaded were the gated ones, not a re-derivation.
+
 ## Do not build a clip mask with ms_explode + ms_dissolve
 
 `counties.R:75` builds its `cb` 5m mask with `st_union() |> st_make_valid()`,
@@ -485,8 +574,12 @@ TILESET=fsa-lfp-counties          Rscript tools/check-coverage.R
 TILESET=census-counties-2020      Rscript tools/check-coverage.R
 TILESET=census-counties-2020-geo  Rscript tools/check-coverage.R
 Rscript tools/check-coverage.R                                      # dd22, default
+TILESET=census-aiannh-2025        Rscript tools/check-coverage.R
+TILESET=census-aiannh-2025-geo    Rscript tools/check-coverage.R
 Rscript tools/check-usdm.R                                          # dummy
 SPACE=geo SAMPLE=6 Rscript tools/check-usdm.R
+Rscript tools/check-aiannh.R                                        # dummy
+SPACE=geo Rscript tools/check-aiannh.R
 ```
 
 `check-coverage.R` takes `TILESET` (the PMTiles basename) as well as the
